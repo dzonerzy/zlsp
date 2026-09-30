@@ -15,6 +15,7 @@ const tree_mod = @import("tree.zig");
 const document = @import("document.zig");
 const lsp = @import("lsp.zig");
 const zabi = @import("zrules_abi.zig");
+const uri_mod = @import("uri.zig");
 
 pub const NONE = tree_mod.NONE;
 
@@ -124,7 +125,10 @@ pub const Analysis = struct {
 };
 
 pub const File = struct {
+    /// The URI it is sent as: the client's, if it opened the file
     uri: []u8,
+    /// Its canonical URI (uri.canonical), what the project knows it by
+    id: []u8,
     path: ?[]u8,
     /// The name other files import it by (its path under the root, without
     /// the extension), the key zrules knows it by
@@ -147,6 +151,7 @@ pub const File = struct {
         if (self.published) |p| gpa.free(p);
         self.doc.deinit();
         gpa.free(self.uri);
+        gpa.free(self.id);
         if (self.path) |p| gpa.free(p);
         gpa.free(self.key);
         gpa.destroy(self);
@@ -170,29 +175,41 @@ pub const Project = struct {
         if (self.last_failure) |m| self.gpa.free(m);
     }
 
+    /// The file a URI names, however the client spells it.
     pub fn get(self: *Project, uri: []const u8) ?*File {
-        return self.files.get(uri);
+        const id = uri_mod.canonical(self.gpa, uri) catch return null;
+        defer self.gpa.free(id);
+        return self.files.get(id);
     }
 
     /// Add a file (or return it if known) with `text`.
     pub fn add(self: *Project, uri: []const u8, path: ?[]const u8, key: []const u8, text: []const u8) !*File {
-        if (self.files.get(uri)) |f| return f;
+        if (self.get(uri)) |f| return f;
         const f = try self.gpa.create(File);
         errdefer self.gpa.destroy(f);
         f.* = .{
             .uri = try self.gpa.dupe(u8, uri),
+            .id = try uri_mod.canonical(self.gpa, uri),
             .path = if (path) |p| try self.gpa.dupe(u8, p) else null,
             .key = try self.gpa.dupe(u8, key),
             .doc = try document.Document.init(self.gpa, text, 0),
         };
-        try self.files.put(self.gpa, f.uri, f);
+        try self.files.put(self.gpa, f.id, f);
         self.generation += 1;
         return f;
     }
 
+    /// Send the file as `uri` from now on (the client's spelling).
+    pub fn rename(self: *Project, f: *File, uri: []const u8) !void {
+        if (std.mem.eql(u8, f.uri, uri)) return;
+        const copy = try self.gpa.dupe(u8, uri);
+        self.gpa.free(f.uri);
+        f.uri = copy;
+    }
+
     pub fn remove(self: *Project, uri: []const u8) void {
-        const f = self.files.get(uri) orelse return;
-        _ = self.files.orderedRemove(uri);
+        const f = self.get(uri) orelse return;
+        _ = self.files.orderedRemove(f.id);
         f.destroy(self.gpa);
         self.generation += 1;
     }

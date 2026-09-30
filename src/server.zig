@@ -481,6 +481,16 @@ pub const Server = struct {
 
     fn openFile(self: *Server, uri: []const u8, text: []const u8, version: i64) !void {
         if (self.project.get(uri)) |f| {
+            // (a file found on disk: sent as the client spells it from now
+            // on; what was published under the other spelling is cleared)
+            if (!std.mem.eql(u8, f.uri, uri)) {
+                if (f.published) |p| {
+                    try self.publish(f.uri, null, &.{}, &f.doc);
+                    self.gpa.free(p);
+                    f.published = null;
+                }
+                try self.project.rename(f, uri);
+            }
             try f.doc.setText(text);
             f.doc.version = version;
             f.open = true;

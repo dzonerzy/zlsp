@@ -67,6 +67,30 @@ pub fn fromPath(gpa: Allocator, path: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// The form of a URI files are identified by: a `file:` URI decoded and
+/// encoded again (`%2E` is `.`, `C%3A` is `c:`), anything else as it is.
+/// Clients spell the same file differently.
+pub fn canonical(gpa: Allocator, uri: []const u8) ![]u8 {
+    const p = (try toPath(gpa, uri)) orelse return gpa.dupe(u8, uri);
+    defer gpa.free(p);
+    return fromPath(gpa, p);
+}
+
+test "canonical URIs" {
+    const gpa = std.testing.allocator;
+    const a = try canonical(gpa, "file:///tmp/dir/main%2Ety");
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("file:///tmp/dir/main.ty", a);
+    const b = try canonical(gpa, "untitled:Untitled-1");
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("untitled:Untitled-1", b);
+    if (builtin.os.tag == .windows) {
+        const c = try canonical(gpa, "file:///C%3A/dir/f.ty");
+        defer gpa.free(c);
+        try std.testing.expectEqualStrings("file:///c:/dir/f.ty", c);
+    }
+}
+
 test "paths from URIs" {
     const gpa = std.testing.allocator;
     const p = (try toPath(gpa, "file:///home/me/a%20b/f.tiny")).?;

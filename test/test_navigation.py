@@ -130,6 +130,18 @@ class TestWorkspace:
         c.change(geometry, c.texts[geometry].replace("fn center()", "fn origin()"), version=3)
         assert c.diagnostics[main] == []
 
+    def test_the_same_file_spelled_differently(self, workspace):
+        # a client's spelling of a file found on disk (here `.` as `%2E`;
+        # on Windows `C:` or `c%3A`) is the same file, sent back as spelled
+        c, root = workspace
+        disk = uri_of(root / "main.ty")
+        spelled = disk.replace("main.ty", "main%2Ety")
+        c.open(spelled, "print(nope);\n")
+        assert [d["code"] for d in c.diagnostics[spelled]] == ["undefined-name"]
+        assert c.diagnostics[disk] == []
+        found = c.request("workspace/symbol", {"query": "describe"})
+        assert found == []  # the disk text isn't a second file
+
     def test_closing_goes_back_to_the_disk(self, workspace):
         c, root = workspace
         main = uri_of(root / "main.ty")

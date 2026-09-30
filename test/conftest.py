@@ -179,7 +179,11 @@ def tiny_client():
 
 
 def uri_of(path):
+    """The URI of a file, as zlsp spells those it finds on disk (Windows:
+    file:///c:/..., the drive letter in lowercase)."""
     path = os.path.abspath(path).replace("\\", "/")
+    if len(path) > 1 and path[1] == ":":
+        path = path[0].lower() + path[1:]
     if not path.startswith("/"):
         path = "/" + path
     return "file://" + path
