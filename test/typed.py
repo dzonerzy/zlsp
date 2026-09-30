@@ -1,5 +1,6 @@
 """A typed language for the tests: structs, functions, optionals, lists,
-imports between files. (zrules' examples/typed, vendored.)"""
+imports between files. (zrules' examples/typed, vendored; its whitespace
+takes \\r too, for files with Windows line endings.)"""
 
 import zgram
 from zrules import Rules, flow, forbid, inside, scopes, types
@@ -55,7 +56,7 @@ addop      = [+\-]
 mulop      = [*/%]
 @silent keyword = ('import' | 'from' | 'struct' | 'fn' | 'if' | 'else' | 'while' | 'loop' | 'do' | 'break' | 'continue' | 'return' | 'let' | 'not' | 'true' | 'false' | 'nil') kw
 @silent kw = ![a-zA-Z0-9_]
-@silent ws = ([ \t\n] | '#' [^\n]*)*
+@silent ws = ([ \t\r\n] | '#' [^\r\n]*)*
 """
 
 PARSER = zgram.compile(GRAMMAR)
