@@ -1,0 +1,18 @@
+from geometry import Point, origin, sum, largest;
+
+fn describe(p: Point) -> str {
+    if p.x == 0.0 {
+        return "on the y axis";
+    } else {
+        return "somewhere else";
+    }
+}
+
+let start = origin();
+let end = start.plus(Point(3, 4));
+let xs = [start.x, end.x, 1];
+
+print(describe(end), sum(xs));
+
+let top: float? = largest(xs);
+print(top);

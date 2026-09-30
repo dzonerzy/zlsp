@@ -1,0 +1,52 @@
+{
+  "name": "tiny-language",
+  "displayName": "tiny",
+  "description": "Support for the tiny language, served by zlsp",
+  "version": "0.1.0",
+  "publisher": "zsuite",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "tiny",
+        "aliases": [
+          "tiny"
+        ],
+        "extensions": [
+          ".tiny"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "tiny",
+      "properties": {
+        "tiny.server.command": {
+          "type": "string",
+          "default": "python",
+          "description": "The program that runs the language server."
+        },
+        "tiny.server.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "tiny.py"
+          ],
+          "description": "Its arguments: the script that calls zlsp's Server(...).start_io()."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

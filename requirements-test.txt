@@ -1,0 +1,5 @@
+pytest>=8.0
+pytest-timeout
+zgram-py>=0.3.3
+zrules-py>=0.1.4
+pyoz>=0.13.7

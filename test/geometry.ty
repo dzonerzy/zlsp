@@ -1,0 +1,39 @@
+# A module: main.ty imports from it.
+
+struct Point {
+    x: float;
+    y: float;
+
+    fn plus(other: Point) -> Point {
+        return Point(x + other.x, y + other.y);
+    }
+}
+
+fn origin() -> Point {
+    return Point(0, 0);
+}
+
+fn sum(values: list[float]) -> float {
+    let total = 0.0;
+    let i = 0;
+    while i < len(values) {
+        total = total + values[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+fn largest(values: list[float]) -> float? {
+    if len(values) == 0 {
+        return nil;
+    }
+    let best = values[0];
+    let i = 1;
+    while i < len(values) {
+        if values[i] > best {
+            best = values[i];
+        }
+        i = i + 1;
+    }
+    return best;
+}
