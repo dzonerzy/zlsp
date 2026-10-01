@@ -25,6 +25,13 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "grammars": [
+      {
+        "language": "tiny",
+        "scopeName": "source.tiny",
+        "path": "./syntaxes/tiny.tmLanguage.json"
+      }
+    ],
     "configuration": {
       "title": "tiny",
       "properties": {

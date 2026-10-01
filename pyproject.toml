@@ -13,7 +13,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Daniele Linguaglossa" }]
 keywords = ["lsp", "language-server", "editor", "ide", "dsl", "language", "zgram", "zrules"]
-dependencies = ["zgram-py>=0.3.3", "zrules-py>=0.1.4"]
+dependencies = ["zgram-py>=0.3.4", "zrules-py>=0.1.5"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

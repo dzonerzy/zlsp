@@ -90,6 +90,23 @@ suite("zlsp in VS Code", function () {
     const hovers = await vscode.commands.executeCommand("vscode.executeHoverProvider", doc.uri, pos(9, 21));
     const text = hovers.flatMap((h) => h.contents.map((c) => c.value || c)).join("\n");
     assert.match(text, /function fib/);
+    // the comment above its definition
+    assert.match(text, /A program with mistakes/);
+  });
+
+  test("signature help", async () => {
+    const help = await vscode.commands.executeCommand("vscode.executeSignatureHelpProvider", doc.uri, pos(9, 24));
+    assert.strictEqual(help.signatures[0].label, "fib(n)");
+    assert.strictEqual(help.activeParameter, 0);
+  });
+
+  test("selection ranges", async () => {
+    const [range] = await vscode.commands.executeCommand("vscode.executeSelectionRangeProvider", doc.uri, [pos(9, 22)]);
+    const texts = [];
+    for (let r = range; r; r = r.parent) texts.push(doc.getText(r.range));
+    assert.strictEqual(texts[0], "fib");
+    assert.ok(texts.includes("fib(i)"), texts.join(" | "));
+    assert.strictEqual(texts[texts.length - 1], doc.getText());
   });
 
   test("outline", async () => {
@@ -107,7 +124,9 @@ suite("zlsp in VS Code", function () {
   test("completion", async () => {
     const list = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", doc.uri, pos(12, 6));
     const labels = list.items.map((i) => (typeof i.label === "string" ? i.label : i.label.label));
-    for (const name of ["fib", "total", "i", "print", "while"]) assert.ok(labels.includes(name), `${name} in ${labels}`);
+    for (const name of ["fib", "total", "i", "print"]) assert.ok(labels.includes(name), `${name} in ${labels}`);
+    // an argument: no statement keywords
+    assert.ok(!labels.includes("while"), labels.join());
   });
 
   test("semantic highlighting", async () => {
@@ -151,5 +170,18 @@ suite("zlsp in VS Code", function () {
     await waitFor("the syntax error", () => codes(doc.uri).join() === "12:syntax,15:break-outside-loop");
     const locs = await vscode.commands.executeCommand("vscode.executeDefinitionProvider", doc.uri, pos(9, 21));
     assert.strictEqual(locs.length, 1);
+  });
+
+  test("a quick fix for a typo", async () => {
+    const editor = vscode.window.activeTextEditor;
+    // (at the end, where `total` is defined)
+    const line = doc.lineCount - 1;
+    await editor.edit((b) => b.insert(pos(line, 0), "print(totl);\n"));
+    await waitFor("the undefined name", () => codes(doc.uri).includes(`${line}:undefined-name`));
+    const actions = await vscode.commands.executeCommand("vscode.executeCodeActionProvider", doc.uri, new vscode.Range(pos(line, 6), pos(line, 10)));
+    const fix = actions.find((a) => a.title === "Change to 'total'");
+    assert.ok(fix, actions.map((a) => a.title).join());
+    await vscode.workspace.applyEdit(fix.edit);
+    assert.strictEqual(doc.lineAt(line).text, "print(total);");
   });
 });

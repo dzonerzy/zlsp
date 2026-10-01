@@ -6,7 +6,7 @@
 
 **A native language server for any language defined with [zgram](https://github.com/dzonerzy/zgram) and checked with [zrules](https://github.com/dzonerzy/zrules).**
 
-Write the grammar and the rules; zlsp gives your language an editor: errors as you type, go to definition, find references, rename, hover, outline, highlighting, folding and completion, in VS Code, Neovim, Helix, Emacs or any editor that speaks the Language Server Protocol.
+Write the grammar and the rules; zlsp gives your language an editor: errors as you type, go to definition, find references, rename, hover, signature help, inlay hints, quick fixes, outline, highlighting, folding and completion, in VS Code, Neovim, Helix, Emacs or any editor that speaks the Language Server Protocol.
 
 [![GitHub Stars](https://img.shields.io/github/stars/dzonerzy/zlsp?style=flat)](https://github.com/dzonerzy/zlsp)
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
@@ -35,25 +35,30 @@ Server(
 That's the whole server. What your editor gets:
 
 - **Diagnostics as you type**: every syntax error in the file (zgram's error recovery, not just the first), and every finding of your rules around them: undefined names, type errors, unreachable code. Nothing is reported about the broken text itself, or because of it.
-- **Navigation**: go to definition and declaration, find references, highlight occurrences, rename, across the files of the project through imports.
-- **Hover**: what a name is and its type.
+- **Navigation**: go to definition, declaration and type definition, find references, highlight occurrences, rename, across the files of the project through imports.
+- **Hover**: what a name is, its type, and the comments written above its definition.
+- **Signature help**: the parameters of the call being typed, the current one marked.
+- **Inlay hints**: the inferred types of the definitions that don't write theirs (`let p = origin()` shows `p: Point`).
+- **Quick fixes**: for an undefined name or member, the visible names it may be a typo of ("Change to 'count'").
 - **Outline and workspace symbols**: the definitions of the file, nested by scope, and a project-wide search.
-- **Semantic highlighting**: keywords from the grammar, names by what they are (functions, parameters, types, fields...), definitions marked, builtins marked, numbers, strings and comments.
-- **Folding**: blocks and runs of comments.
-- **Completion**: the names visible at the cursor, the members after `a.b.`, and the keywords.
+- **Semantic highlighting**: keywords from the grammar, names by what they are (functions, parameters, types, fields...), definitions marked, builtins marked, numbers, strings and comments; sent as deltas while you edit.
+- **Folding and selection ranges**: blocks and runs of comments; expanding the selection node by node.
+- **Completion**: the names visible at the cursor, the members after `a.b.`, and the keywords the grammar takes there.
+- **Your own features** in Python: hooks add to hover, completion and code actions, and provide formatting.
+- **A TextMate grammar** for VS Code, generated from the grammar and the configuration.
 
 The protocol, the documents and every feature are native (Zig); Python only configures the server and runs your rules.
 
 ## Performance
 
-Every edit parses and checks the whole file again, and the project around it: that is fast enough for any file a person edits. With the typed example language (names, types and flow checked), after each keystroke:
+Every edit parses the edited file again, and checks it with the files that import it (directly or not) and those they import; the rest of the project keeps its analysis. With the typed example language (names, types and flow checked), after each keystroke:
 
 | File | Parse, check, publish | Semantic tokens | Outline | Completion |
 |------|----------------------|-----------------|---------|------------|
 | 54 KB (500 functions) | 2.2 ms | 1.6 ms | 0.7 ms | 0.6 ms |
 | 553 KB (5,000 functions) | 18.5 ms | 13.5 ms | 6.3 ms | 5.5 ms |
 
-A burst of keystrokes costs one analysis: edits are applied as they arrive, and the analysis runs when no more input is waiting. Only the edited file is parsed again; zrules checks the project in parallel.
+A burst of keystrokes costs one analysis: edits are applied as they arrive, and the analysis runs when no more input is waiting. An analysis in progress stops between files when a message arrives (a request is never stuck behind the analysis of a large workspace), and goes on afterwards. An edit in a workspace of 300 files that don't import the edited one checks one file.
 
 ## An example: tiny
 
@@ -123,13 +128,17 @@ language-servers = ["tiny"]
   (add-to-list 'eglot-server-programs '(tiny-mode "python" "/path/to/tiny.py")))
 ```
 
-**VS Code** starts language servers from extensions: [`editors/vscode`](https://github.com/dzonerzy/zlsp/tree/main/editors/vscode) is a minimal one to copy (a language id, its file extensions, and the command that runs the server).
+**VS Code** starts language servers from extensions: [`editors/vscode`](https://github.com/dzonerzy/zlsp/tree/main/editors/vscode) is a minimal one to copy (a language id, its file extensions, its TextMate grammar, and the command that runs the server).
+
+Both are tested for real: the VS Code extension's suite runs in VS Code, and [`editors/neovim/test.lua`](https://github.com/dzonerzy/zlsp/blob/main/editors/neovim/test.lua) in Neovim, each feature asked through the editor's own LSP client.
 
 ## Configuration
 
 ```python
 Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=None,
-       symbols=None, tokens=None, comments=None, folding=None, keywords=None)
+       symbols=None, tokens=None, comments=None, folding=None, keywords=None,
+       hover=None, completion=None, code_actions=None, format=None, configuration=None,
+       log=None)
 ```
 
 | Option | |
@@ -144,8 +153,43 @@ Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=
 | `comments` | the comment syntax: line prefixes (`"#"`, `"//"`) and `(open, close)` pairs (`("/*", "*/")`), for highlighting and folding |
 | `folding` | selectors of the foldable nodes; by default every node with children that spans lines |
 | `keywords` | the keywords, for highlighting and completion; by default the grammar's word literals (`parser.literals()`) |
+| `hover`, `completion`, `code_actions`, `format`, `configuration` | Python functions extending the features (see Hooks) |
+| `log` | a file to log to: every message in and out, and each analysis with its time (created, or emptied, when the server starts) |
 
-Selectors are zrules selectors. Names defined without a configured kind show as functions if their type is a function's, as types if they name a type, and as variables otherwise.
+Selectors are zrules selectors. Names defined without a configured kind show as functions if their type is a function's, as types if they name a type, as functions if they are only ever called, and as variables otherwise.
+
+## Hooks
+
+Python functions that add to what the server does. Each gets the file's URI, its text, and the zrules `Analysis` of the file (None without rules) to look things up in (`analysis.symbol_at(offset)`, `analysis.visible(offset)`, `analysis.type_of(node)`...). Offsets are byte offsets into the UTF-8 text, as in zgram and zrules.
+
+```python
+def hover(uri, text, offset, analysis):
+    """Markdown shown below the hover (alone if there's no name there), or None."""
+
+def completion(uri, text, offset, analysis):
+    """More completion items: str labels, or dicts of LSP CompletionItem fields."""
+    return ["todo", {"label": "main", "kind": 3, "insertText": "main()"}]
+
+def code_actions(uri, text, start, end, diagnostics, analysis):
+    """Actions for the range [start, end): the diagnostics there are dicts
+    (start, end, severity, code, message). Each action is a dict: a title,
+    the edits of the file as (start, end, new_text), and optionally its kind
+    ("quickfix" by default) and whether it's the preferred one."""
+    return [{"title": "Use 'let'", "edits": [(start, end, "let")], "preferred": True}]
+
+def format(uri, text, analysis):
+    """The formatted text (None: leave it). With this hook the server offers formatting."""
+
+def configuration(settings):
+    """The editor's settings changed (workspace/didChangeConfiguration). The
+    project is checked again afterwards: a hook can change what the rules do."""
+```
+
+A hook raising an exception doesn't fail the request: the editor gets the error in its log, and the feature works without the hook.
+
+## TextMate grammar
+
+`server.textmate(scope=None)` returns a TextMate grammar (JSON) for the language: its comments, strings (from the quote literals of the grammar), numbers and keywords. VS Code uses it until the server's semantic tokens arrive, and where they are off. The example's is generated with `python tiny.py --textmate`, and its extension declares it in `contributes.grammars`.
 
 ## Features in detail
 
@@ -153,11 +197,21 @@ Selectors are zrules selectors. Names defined without a configured kind show as 
 
 **Definition, references, rename.** From the symbol table of the `scopes()` rule. A name imported from another file leads to its definition there, and references and renames include every file that imports it. Builtins can't be renamed.
 
-**Hover.** The kind, name and type of the name under the cursor: `function f: fn(int) -> int`.
+**Hover.** The kind, name and type of the name under the cursor: `function f: fn(int) -> int`; below it, the comments written right above its definition (each alone on its line, no blank line between them and the definition), without their markers.
+
+**Signature help.** In a call being typed, back to its unclosed `(`: the callee's parameters, from its type (`fn(int, str) -> bool`) and its parameters' names (the names of kind `parameter` in its scope), and which one the cursor is at.
+
+**Inlay hints.** After each definition of a variable, constant, parameter or field without a written type (no child labelled `type` in its construct), the type zrules inferred.
+
+**Type definition.** The definition of the type of the name under the cursor (`Point` for a `p: Point`).
+
+**Code actions.** For a diagnostic on a name that doesn't refer to anything (an undefined name, a missing member): the names visible there (the members, after a dot) within a few edits of it, the closest first, as quick fixes; then the `code_actions` hook's.
 
 **Highlighting.** Each character belongs to at most one token, taken in this order: comments, strings, names (their kind, `declaration` on definitions, `defaultLibrary` on builtins), the other token rules, keywords. Multi-line tokens are split per line unless the editor takes them whole.
 
-**Completion.** The names a name written at the cursor could refer to, by the scope rules (ordering, hoisting, imports), innermost first, then builtins, then keywords. After a `.`, the members of what the name chain before it stands for: a struct's fields and methods, a module's names, the fields of a variable's type. The chain is read from the text, since the line being typed rarely parses.
+**Completion.** The names a name written at the cursor could refer to, by the scope rules (ordering, hoisting, imports), innermost first, then builtins, then keywords: those the grammar takes at the cursor (zgram's `parser.expected()`; all of them after a syntax error, where it can't tell). After a `.`, the members of what the name chain before it stands for: a struct's fields and methods, a module's names, the fields of a variable's type. The chain is read from the text, since the line being typed rarely parses.
+
+**Workspace.** The files of every workspace folder, folders added and removed while the editor runs. A file's key is its path under its folder; two folders with the same path (`client/lib.ty`, `server/lib.ty`) keep their files apart: the second is known by its folder's name too (`server/lib`).
 
 **Positions** are in UTF-16 code units, as LSP expects, or UTF-8 when the editor offers it.
 
@@ -168,6 +222,7 @@ Selectors are zrules selectors. Names defined without a configured kind show as 
 | `Server(parser, rules=None, **options)` | a language server (see Configuration) |
 | `server.start_io()` | serve over stdin/stdout until the editor sends `exit` or closes the input; returns the exit code (0 after `shutdown`). While it serves, `sys.stdout` is `sys.stderr`, so a `print()` in a rule doesn't break the protocol |
 | `server.handle(message)` | run one JSON-RPC message (`str` or `bytes`) and return the messages to send (JSON `str`s), diagnostics included: for tests, and for embedding the server in another transport |
+| `server.textmate(scope=None)` | a TextMate grammar for the language (JSON), `source.<name>` by default |
 | `server.exit_code` | set once the editor sent `exit` |
 | `zlsp.version()` | the version |
 
@@ -186,15 +241,15 @@ editor ──stdin──► reader thread ──queue──► main loop ──s
 ```
 
 - **One thread with the GIL**, which waits for input without it. A second thread only reads stdin.
-- **Native all the way.** Trees are read through zgram's `zgram.tree.v1` capsule, the symbol table through zrules' `zrules.analysis.v1`, and selectors run through `zrules.selector.v1`: no Python object is made per node, symbol or use.
+- **Native all the way.** Trees are read through zgram's `zgram.tree.v1` capsule, the symbol table and the imports through zrules' `zrules.analysis.v2`, and selectors run through `zrules.selector.v1`: no Python object is made per node, symbol or use.
+- **Incremental checking**: the files an edit can affect (the edited ones, those importing them, with what they import) are checked again; the others keep their analyses.
 - **Debounced by the input**: edits are applied as they arrive; the analysis runs when the input queue is empty, so a burst of keystrokes costs one.
-- **Cancellation**: a request cancelled before the server reached it is answered with `RequestCancelled`.
+- **Cancellation**: a request cancelled before the server reached it is answered with `RequestCancelled`; an analysis gives way to the messages that arrive while it runs.
 
 ## Known Issues
 
-- Incremental parsing: every edit parses the whole file again (18 ms for 553 KB, well within typing speed for files people edit).
-- Semantic tokens are sent whole, not as deltas.
-- Formatting, code actions and signature help are not provided.
+- Incremental parsing: every edit parses the whole edited file again (18 ms for 553 KB, well within typing speed for files people edit).
+- Formatting is the `format` hook's: zlsp has no formatter of its own.
 
 ## Project Structure
 
@@ -208,12 +263,14 @@ src/
   json.zig         # writing JSON; reading helpers over std.json
   uri.zig          # file:// URIs and paths
   lsp.zig          # symbol kinds, token types, error codes
+  textmate.zig     # the TextMate grammar
   tree.zig         # zgram's tree capsule (consumer copy)
   zrules_abi.zig   # zrules' analysis and selector capsules (consumer copy)
   pyhelp.zig       # Python C API helpers
 examples/tiny/     # a complete language server for a small language
-editors/vscode/    # a VS Code extension to copy
-test/              # the protocol, diagnostics, navigation, features, over stdio
+editors/vscode/    # a VS Code extension to copy, and its tests in VS Code
+editors/neovim/    # the Neovim test
+test/              # the protocol, diagnostics, navigation, features, hooks, over stdio
 ```
 
 ## License

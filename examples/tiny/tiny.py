@@ -1,7 +1,8 @@
 """A language server for tiny, a small language: zgram parses it, zrules
 checks it, zlsp serves it to an editor.
 
-    python tiny.py        # speaks LSP over stdin/stdout: point your editor at it
+    python tiny.py              # speaks LSP over stdin/stdout: point your editor at it
+    python tiny.py --textmate   # prints its TextMate grammar (for VS Code)
 
 The editor gets, as you type: syntax errors (every one, not just the first),
 'break' outside a loop, 'return' outside a function, undefined and duplicate
@@ -88,4 +89,10 @@ def make_server():
 
 
 if __name__ == "__main__":
+    if "--textmate" in sys.argv:
+        # the TextMate grammar of editors/vscode/syntaxes/tiny.tmLanguage.json
+        import json
+
+        print(json.dumps(json.loads(make_server().textmate()), indent=2))
+        sys.exit(0)
     sys.exit(make_server().start_io())

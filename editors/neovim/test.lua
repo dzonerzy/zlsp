@@ -119,6 +119,7 @@ check("references", table.concat(lines, ",") == "1,3,3,9", lines)
 
 local hover = request("textDocument/hover", at(9, 21))
 check("hover", hover and hover.contents.value:find("function fib") ~= nil, hover)
+check("hover: the doc comment", hover and hover.contents.value:find("A program with mistakes") ~= nil, hover)
 
 local symbols = request("textDocument/documentSymbol", { textDocument = { uri = uri } })
 local names = {}
@@ -132,7 +133,11 @@ local labels = {}
 for _, item in ipairs((completion or {}).items or {}) do
   labels[item.label] = true
 end
-check("completion", labels.fib and labels.total and labels.print and labels["while"], vim.tbl_keys(labels))
+-- (an argument: no statement keywords)
+check("completion", labels.fib and labels.total and labels.print and not labels["while"], vim.tbl_keys(labels))
+
+local sig = request("textDocument/signatureHelp", at(9, 24))
+check("signature help", sig and sig.signatures[1].label == "fib(n)", sig)
 
 local folds = request("textDocument/foldingRange", { textDocument = { uri = uri } })
 local spans = {}
@@ -169,6 +174,28 @@ vim.api.nvim_buf_set_lines(buf, 12, 12, false, { "let missing = 1;" })
 check("diagnostics after an edit", vim.wait(10000, function()
   return diag_codes(buf) == "14:break-outside-loop"
 end), diag_codes(buf))
+
+-- A quick fix
+local last = vim.api.nvim_buf_line_count(buf) - 1
+vim.api.nvim_buf_set_lines(buf, last, last, false, { "print(totl);" })
+vim.wait(10000, function()
+  return diag_codes(buf):find(last .. ":undefined%-name") ~= nil
+end)
+local actions = request("textDocument/codeAction", {
+  textDocument = { uri = uri },
+  range = { start = { line = last, character = 6 }, ["end"] = { line = last, character = 10 } },
+  context = { diagnostics = {} },
+})
+local fix
+for _, a in ipairs(actions or {}) do
+  if a.title == "Change to 'total'" then
+    fix = a
+  end
+end
+if fix then
+  vim.lsp.util.apply_workspace_edit(fix.edit, client.offset_encoding)
+end
+check("a quick fix", vim.api.nvim_buf_get_lines(buf, last, last + 1, false)[1] == "print(total);", actions)
 
 client:stop()
 vim.wait(5000, function()

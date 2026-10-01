@@ -50,6 +50,12 @@ pub const Server = struct {
     /// Keywords, for lookups
     keywords: std.StringHashMapUnmanaged(void) = .empty,
     next_request_id: i64 = 1,
+    /// For the semantic tokens' result ids
+    next_result_id: u64 = 1,
+    /// The log file (`log=` in Python): every message in and out, and the
+    /// analyses' times; the time it was opened (ms)
+    log_file: ?std.Io.File = null,
+    log_start: i64 = 0,
     /// Set by the transport: is input waiting? (stops an idle analysis)
     interrupt: ?project_mod.Project.Interrupt = null,
     client: struct {
@@ -66,6 +72,7 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.log_file) |file| file.close(self.io);
         self.project.deinit();
         for (self.roots.items) |r| self.gpa.free(r);
         self.roots.deinit(self.gpa);
@@ -81,8 +88,28 @@ pub const Server = struct {
     // Messages
     // ------------------------------------------------------------------
 
+    /// Log to the file at `path` (created, or emptied).
+    pub fn openLog(self: *Server, path: []const u8) !void {
+        self.log_file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
+        self.log_start = std.Io.Clock.awake.now(self.io).toMilliseconds();
+    }
+
+    fn millis(self: *const Server) i64 {
+        return std.Io.Clock.awake.now(self.io).toMilliseconds();
+    }
+
+    /// A line of the log, with the time since it was opened.
+    fn trace(self: *Server, comptime fmt: []const u8, args: anytype) void {
+        const file = self.log_file orelse return;
+        const ms = self.millis() - self.log_start;
+        const line = std.fmt.allocPrint(self.gpa, "[{d}.{d:0>3}] " ++ fmt ++ "\n", .{ @divTrunc(ms, 1000), @as(u64, @intCast(@mod(ms, 1000))) } ++ args) catch return;
+        defer self.gpa.free(line);
+        file.writeStreamingAll(self.io, line) catch {};
+    }
+
     /// Handle one message (a JSON body).
     pub fn handle(self: *Server, body: []const u8) !void {
+        self.trace("--> {s}", .{body});
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -138,7 +165,9 @@ pub const Server = struct {
     fn analyzeWith(self: *Server, interrupt: ?project_mod.Project.Interrupt) !project_mod.Project.Outcome {
         var buf: [512]u8 = undefined;
         var len: usize = 0;
+        const t0 = if (self.log_file != null) self.millis() else 0;
         const outcome = try self.project.analyze(&buf, &len, interrupt);
+        if (outcome != .unchanged) self.trace("analysis {s} in {d} ms ({d} files)", .{ @tagName(outcome), self.millis() - t0, self.project.files.count() });
         if (outcome != .failed) return outcome;
         const text = buf[0..len];
         if (self.project.last_failure) |prev| {
@@ -165,8 +194,15 @@ pub const Server = struct {
             .{ "textDocument/hover", hover },
             .{ "textDocument/documentSymbol", documentSymbol },
             .{ "textDocument/semanticTokens/full", semanticTokens },
+            .{ "textDocument/semanticTokens/full/delta", semanticTokensDelta },
             .{ "textDocument/foldingRange", foldingRange },
             .{ "textDocument/completion", completion },
+            .{ "textDocument/inlayHint", inlayHint },
+            .{ "textDocument/typeDefinition", typeDefinition },
+            .{ "textDocument/signatureHelp", signatureHelp },
+            .{ "textDocument/selectionRange", selectionRange },
+            .{ "textDocument/codeAction", codeAction },
+            .{ "textDocument/formatting", formatting },
             .{ "workspace/symbol", workspaceSymbol },
         };
         for (table) |entry| {
@@ -205,6 +241,20 @@ pub const Server = struct {
                 const u = json.getString(change, "uri") orelse continue;
                 try self.watchedChange(u, json.getInt(change, "type") orelse 2);
             }
+        } else if (std.mem.eql(u8, method, "workspace/didChangeWorkspaceFolders")) {
+            const event = json.get(params, "event");
+            for (json.getArray(event, "removed") orelse &.{}) |folder| {
+                const u = json.getString(folder, "uri") orelse continue;
+                try self.removeRoot(u);
+            }
+            for (json.getArray(event, "added") orelse &.{}) |folder| {
+                const u = json.getString(folder, "uri") orelse continue;
+                const p = (try uri_mod.toPath(self.gpa, u)) orelse continue;
+                try self.roots.append(self.gpa, p);
+                self.scanWorkspace(p) catch {};
+            }
+        } else if (std.mem.eql(u8, method, "workspace/didChangeConfiguration")) {
+            try self.configurationChanged(params);
         } else if (std.mem.eql(u8, method, "$/cancelRequest")) {
             const idv = json.get(params, "id") orelse return;
             const text = try std.json.Stringify.valueAlloc(self.gpa, idv, .{});
@@ -221,6 +271,7 @@ pub const Server = struct {
     fn send(self: *Server, w: *json.Writer) !void {
         const body = try w.toOwned();
         errdefer self.gpa.free(body);
+        self.trace("<-- {s}", .{body});
         try self.out.append(self.gpa, body);
     }
 
@@ -338,12 +389,43 @@ pub const Server = struct {
         try w.fieldBool("documentSymbolProvider", true);
         try w.fieldBool("workspaceSymbolProvider", true);
         try w.fieldBool("foldingRangeProvider", true);
+        try w.fieldBool("inlayHintProvider", true);
+        try w.fieldBool("typeDefinitionProvider", true);
+        try w.fieldBool("selectionRangeProvider", true);
+        try w.key("codeActionProvider");
+        try w.beginObject();
+        try w.key("codeActionKinds");
+        try w.beginArray();
+        try w.string("quickfix");
+        try w.endArray();
+        try w.endObject();
+        if (self.config.format_hook != null) try w.fieldBool("documentFormattingProvider", true);
+        try w.key("signatureHelpProvider");
+        try w.beginObject();
+        try w.key("triggerCharacters");
+        try w.beginArray();
+        try w.string("(");
+        try w.string(",");
+        try w.endArray();
+        try w.key("retriggerCharacters");
+        try w.beginArray();
+        try w.string(")");
+        try w.endArray();
+        try w.endObject();
         try w.key("completionProvider");
         try w.beginObject();
         try w.key("triggerCharacters");
         try w.beginArray();
         try w.string(".");
         try w.endArray();
+        try w.endObject();
+        try w.key("workspace");
+        try w.beginObject();
+        try w.key("workspaceFolders");
+        try w.beginObject();
+        try w.fieldBool("supported", true);
+        try w.fieldBool("changeNotifications", true);
+        try w.endObject();
         try w.endObject();
         try w.key("semanticTokensProvider");
         try w.beginObject();
@@ -358,7 +440,10 @@ pub const Server = struct {
         for (std.meta.fieldNames(lsp.Modifier)) |name| try w.string(name);
         try w.endArray();
         try w.endObject();
-        try w.fieldBool("full", true);
+        try w.key("full");
+        try w.beginObject();
+        try w.fieldBool("delta", true);
+        try w.endObject();
         try w.fieldBool("range", false);
         try w.endObject();
         try w.endObject();
@@ -425,14 +510,18 @@ pub const Server = struct {
         return false;
     }
 
-    /// The key zrules knows a file by: its path under a root without the
-    /// extension (`lib/util`), else its name without it.
-    fn keyOf(self: *const Server, a: Allocator, path_opt: ?[]const u8, uri: []const u8) ![]u8 {
+    /// The key zrules knows a new file by: its path under a root without the
+    /// extension (`lib/util`), else its name without it. Unique: if another
+    /// file has it (the same path under two workspace folders), it is
+    /// prefixed with its folder's name (`client/lib/util`), then numbered.
+    fn keyOf(self: *Server, a: Allocator, path_opt: ?[]const u8, uri: []const u8) ![]u8 {
         const p = path_opt orelse return a.dupe(u8, uri);
         var rel: []const u8 = std.fs.path.basename(p);
+        var root_name: []const u8 = "";
         for (self.roots.items) |root| {
-            if (p.len > root.len + 1 and std.mem.startsWith(u8, p, root) and (p[root.len] == '/' or p[root.len] == '\\')) {
+            if (isUnder(p, root)) {
                 rel = p[root.len + 1 ..];
+                root_name = std.fs.path.basename(root);
                 break;
             }
         }
@@ -442,11 +531,115 @@ pub const Server = struct {
                 break;
             }
         }
-        const key = try a.dupe(u8, rel);
+        var key = try a.dupe(u8, rel);
         for (key) |*c| {
             if (c.* == '\\') c.* = '/';
         }
-        return key;
+        if (self.project.byKey(key) == null) return key;
+        if (root_name.len != 0) {
+            const prefixed = try std.fmt.allocPrint(a, "{s}/{s}", .{ root_name, key });
+            if (self.project.byKey(prefixed) == null) {
+                a.free(key);
+                return prefixed;
+            }
+            a.free(prefixed);
+        }
+        var n: usize = 2;
+        while (true) : (n += 1) {
+            const numbered = try std.fmt.allocPrint(a, "{s}#{d}", .{ key, n });
+            if (self.project.byKey(numbered) == null) {
+                a.free(key);
+                key = numbered;
+                return key;
+            }
+            a.free(numbered);
+        }
+    }
+
+    /// A workspace folder closed: its files go, except those open.
+    fn removeRoot(self: *Server, uri: []const u8) !void {
+        const root = (try uri_mod.toPath(self.gpa, uri)) orelse return;
+        defer self.gpa.free(root);
+        for (self.roots.items, 0..) |r, i| {
+            if (!std.mem.eql(u8, r, root)) continue;
+            self.gpa.free(self.roots.orderedRemove(i));
+            break;
+        }
+        var gone: std.ArrayList([]u8) = .empty;
+        defer {
+            for (gone.items) |u| self.gpa.free(u);
+            gone.deinit(self.gpa);
+        }
+        for (self.project.files.values()) |f| {
+            const p = f.path orelse continue;
+            if (f.open or !isUnder(p, root)) continue;
+            try gone.append(self.gpa, try self.gpa.dupe(u8, f.uri));
+        }
+        for (gone.items) |u| try self.forget(u);
+    }
+
+    /// workspace/didChangeConfiguration: the settings go to the
+    /// `configuration` hook (which may change what the rules check: the
+    /// whole project is checked again).
+    fn configurationChanged(self: *Server, params: ?Value) !void {
+        const hook = self.config.configuration_hook orelse return;
+        const settings = json.get(params, "settings") orelse return;
+        const text = try std.json.Stringify.valueAlloc(self.gpa, settings, .{});
+        defer self.gpa.free(text);
+        const result = try self.callHook("configuration", hook, &.{jsonToPython(text)});
+        if (result) |r| py.Py_DecRef(r);
+        self.project.structure_gen += 1;
+        self.project.generation += 1;
+    }
+
+    /// Call a feature hook with `(uri, text, *extra, analysis)` (the zrules
+    /// Analysis, or None); its result, null for None or if it raised (then
+    /// logged). Takes the `extra` references.
+    fn callFileHook(self: *Server, a: Allocator, name: []const u8, hook: *PyObject, f: *File, extra: []const ?*PyObject) !?*PyObject {
+        const args = try a.alloc(?*PyObject, extra.len + 3);
+        args[0] = ph.newString(f.uri);
+        args[1] = ph.newString(f.doc.text.items);
+        @memcpy(args[2 .. 2 + extra.len], extra);
+        const checked: *PyObject = if (f.analysis) |an| an.checked orelse py.Py_None() else py.Py_None();
+        py.Py_IncRef(checked);
+        args[args.len - 1] = checked;
+        return self.callHook(name, hook, args);
+    }
+
+    /// Call a hook with `args` (taking the references; a null one means
+    /// creating it raised); null for None or if it raised (then logged).
+    fn callHook(self: *Server, name: []const u8, hook: *PyObject, args: []const ?*PyObject) !?*PyObject {
+        defer for (args) |o| if (o) |x| py.Py_DecRef(x);
+        for (args) |o| if (o == null) {
+            try self.hookFailed(name);
+            return null;
+        };
+        const tuple = py.c.PyTuple_New(@intCast(args.len)) orelse {
+            try self.hookFailed(name);
+            return null;
+        };
+        defer py.Py_DecRef(tuple);
+        for (args, 0..) |o, i| {
+            py.Py_IncRef(o.?);
+            _ = py.c.PyTuple_SetItem(tuple, @intCast(i), o.?);
+        }
+        const result = py.c.PyObject_Call(hook, tuple, null) orelse {
+            try self.hookFailed(name);
+            return null;
+        };
+        if (result == py.Py_None()) {
+            py.Py_DecRef(result);
+            return null;
+        }
+        return result;
+    }
+
+    /// A hook raised: the editor gets the error in its log.
+    fn hookFailed(self: *Server, name: []const u8) !void {
+        var buf: [512]u8 = undefined;
+        const text = ph.takeError(&buf);
+        var msg: [600]u8 = undefined;
+        try self.logMessage(1, std.fmt.bufPrint(&msg, "the {s} hook failed: {s}", .{ name, text }) catch text);
     }
 
     fn scanWorkspace(self: *Server, root: []const u8) !void {
@@ -553,7 +746,7 @@ pub const Server = struct {
 
     fn underRoot(self: *const Server, path: []const u8) bool {
         for (self.roots.items) |root| {
-            if (std.mem.startsWith(u8, path, root)) return true;
+            if (isUnder(path, root)) return true;
         }
         return false;
     }
@@ -836,8 +1029,33 @@ pub const Server = struct {
         try w.endObject();
     }
 
+    /// The hover: the symbol's kind, name and type, the comments written
+    /// above its definition, and what the `hover` hook adds.
     fn hover(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
-        const at = (try self.symbolAtRequest(params)) orelse return w.null_();
+        const f = (try self.target(params)) orelse return w.null_();
+        const offset = try self.offsetIn(f, params);
+        const extra: ?[]const u8 = if (self.config.hover_hook) |hook| blk: {
+            const r = (try self.callFileHook(a, "hover", hook, f, &.{py.c.PyLong_FromLongLong(offset)})) orelse break :blk null;
+            defer py.Py_DecRef(r);
+            const s = ph.utf8(r, "the hover hook's result") orelse {
+                try self.hookFailed("hover");
+                break :blk null;
+            };
+            break :blk try a.dupe(u8, s);
+        } else null;
+        const at_sym = f.analysis.?.symbolAt(offset);
+        if (at_sym == null) {
+            const md = extra orelse return w.null_();
+            try w.beginObject();
+            try w.key("contents");
+            try w.beginObject();
+            try w.fieldString("kind", "markdown");
+            try w.fieldString("value", md);
+            try w.endObject();
+            try w.endObject();
+            return;
+        }
+        const at = .{ .file = f, .sym = at_sym.?, .offset = offset };
         const s = at.sym;
         const kind = self.kindOf(at.file, s);
         var text: std.ArrayList(u8) = .empty;
@@ -858,6 +1076,16 @@ pub const Server = struct {
             try text.appendSlice(a, key);
             try text.append(a, '`');
         }
+        if (self.definitionOf(at.file, s)) |d| {
+            if (try self.docComment(a, d.file, d.sym.def.?.start)) |doc| {
+                try text.appendSlice(a, "\n\n");
+                try text.appendSlice(a, doc);
+            }
+        }
+        if (extra) |md| {
+            try text.appendSlice(a, "\n\n---\n\n");
+            try text.appendSlice(a, md);
+        }
         var span = s.def orelse Span{ .start = at.offset, .end = at.offset };
         if (!span.contains(at.offset)) {
             for (s.uses) |u| {
@@ -873,6 +1101,69 @@ pub const Server = struct {
         try w.key("range");
         try self.writeRange(w, &at.file.doc, span);
         try w.endObject();
+    }
+
+    /// The comments written right above the line of `offset` (each alone on
+    /// its line, none with a blank line after), without their markers; null
+    /// if none.
+    fn docComment(self: *Server, a: Allocator, f: *File, offset: u32) !?[]const u8 {
+        const an = f.analysis orelse return null;
+        const text = an.text;
+        const comments = try self.commentSpans(a, an);
+        var boundary: usize = lineStart(text, offset);
+        var first: usize = comments.len; // the topmost comment taken
+        var i = comments.len;
+        while (i > 0) {
+            i -= 1;
+            const c = comments[i];
+            if (c.end > boundary) continue;
+            const between = text[c.end..boundary];
+            if (std.mem.trim(u8, between, " \t\r\n").len != 0 or std.mem.count(u8, between, "\n") != 1) break;
+            const ls = lineStart(text, c.start);
+            if (std.mem.trim(u8, text[ls..c.start], " \t").len != 0) break;
+            first = i;
+            boundary = ls;
+        }
+        if (first == comments.len) return null;
+        var out: std.ArrayList(u8) = .empty;
+        for (comments[first..]) |c| {
+            if (c.end > lineStart(text, offset)) break;
+            const body = self.commentBody(text[c.start..c.end]);
+            var lines = std.mem.splitScalar(u8, body.text, '\n');
+            while (lines.next()) |raw| {
+                var line = std.mem.trimEnd(u8, raw, " \t\r");
+                if (body.block) {
+                    // (in a block comment: a leading `*` column goes)
+                    const t = std.mem.trimStart(u8, line, " \t");
+                    if (t.len > 0 and t[0] == '*') line = std.mem.trimStart(u8, t[1..], " ");
+                }
+                if (out.items.len != 0) try out.append(a, '\n');
+                try out.appendSlice(a, line);
+            }
+        }
+        const doc = std.mem.trim(u8, out.items, " \t\r\n");
+        return if (doc.len == 0) null else doc;
+    }
+
+    /// A comment without its markers (`// x`, `/// x`, `/* x */`, `/** x */`).
+    fn commentBody(self: *Server, c: []const u8) struct { text: []const u8, block: bool } {
+        for (self.config.block_comments) |pair| {
+            if (!std.mem.startsWith(u8, c, pair[0])) continue;
+            var body = c[pair[0].len..];
+            if (std.mem.endsWith(u8, body, pair[1])) body = body[0 .. body.len - pair[1].len];
+            const last = pair[0][pair[0].len - 1];
+            while (body.len > 0 and body[0] == last) body = body[1..];
+            return .{ .text = body, .block = true };
+        }
+        for (self.config.line_comments) |marker| {
+            if (!std.mem.startsWith(u8, c, marker)) continue;
+            var body = c[marker.len..];
+            const last = marker[marker.len - 1];
+            while (body.len > 0 and (body[0] == last or body[0] == '!')) body = body[1..];
+            if (body.len > 0 and body[0] == ' ') body = body[1..];
+            return .{ .text = body, .block = false };
+        }
+        return .{ .text = c, .block = false };
     }
 
     /// The definitions a file's outline shows: its own (not builtins or
@@ -1078,6 +1369,61 @@ pub const Server = struct {
 
     fn semanticTokens(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
         const f = (try self.target(params)) orelse return w.null_();
+        const data = try self.tokenData(a, f);
+        try self.keepTokens(f, data);
+        try w.beginObject();
+        try w.fieldString("resultId", try std.fmt.allocPrint(a, "{d}", .{f.tokens_id}));
+        try w.key("data");
+        try w.beginArray();
+        for (data) |v| try w.int(v);
+        try w.endArray();
+        try w.endObject();
+    }
+
+    /// The tokens as an edit of those last sent (the client's
+    /// `previousResultId`): the part between what's common at both ends.
+    fn semanticTokensDelta(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
+        const f = (try self.target(params)) orelse return w.null_();
+        const prev_id = json.getString(params, "previousResultId") orelse "";
+        const prev_opt = f.tokens;
+        const matches = prev_opt != null and std.mem.eql(u8, prev_id, try std.fmt.allocPrint(a, "{d}", .{f.tokens_id}));
+        if (!matches) return self.semanticTokens(a, w, params);
+        const prev = try a.dupe(u32, prev_opt.?);
+        const data = try self.tokenData(a, f);
+        try self.keepTokens(f, data);
+        var head: usize = 0;
+        while (head < prev.len and head < data.len and prev[head] == data[head]) head += 1;
+        var tail: usize = 0;
+        while (tail < prev.len - head and tail < data.len - head and prev[prev.len - 1 - tail] == data[data.len - 1 - tail]) tail += 1;
+        try w.beginObject();
+        try w.fieldString("resultId", try std.fmt.allocPrint(a, "{d}", .{f.tokens_id}));
+        try w.key("edits");
+        try w.beginArray();
+        if (head != prev.len or head != data.len) {
+            try w.beginObject();
+            try w.fieldInt("start", @intCast(head));
+            try w.fieldInt("deleteCount", @intCast(prev.len - head - tail));
+            try w.key("data");
+            try w.beginArray();
+            for (data[head .. data.len - tail]) |v| try w.int(v);
+            try w.endArray();
+            try w.endObject();
+        }
+        try w.endArray();
+        try w.endObject();
+    }
+
+    /// Remember the tokens sent for `f` (under a new result id).
+    fn keepTokens(self: *Server, f: *File, data: []const u32) !void {
+        const copy = try self.gpa.dupe(u32, data);
+        if (f.tokens) |t| self.gpa.free(t);
+        f.tokens = copy;
+        f.tokens_id = self.next_result_id;
+        self.next_result_id += 1;
+    }
+
+    /// The semantic tokens of a file, encoded as the protocol wants.
+    fn tokenData(self: *Server, a: Allocator, f: *File) ![]u32 {
         const an = f.analysis.?;
         const text = an.text;
         const Tok = struct { start: u32, end: u32, type: lsp.TokenType, mods: u32 };
@@ -1174,12 +1520,7 @@ pub const Server = struct {
                 start = doc.lines.items[p.line + 1];
             }
         }
-        try w.beginObject();
-        try w.key("data");
-        try w.beginArray();
-        for (data.items) |v| try w.int(v);
-        try w.endArray();
-        try w.endObject();
+        return data.items;
     }
 
     fn completion(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
@@ -1203,6 +1544,12 @@ pub const Server = struct {
                 for (scope.file.analysis.?.syms) |*m| {
                     if (m.scope != scope.node or m.builtin) continue;
                     try self.completionItem(a, w, &seen, scope.file, m, "0");
+                }
+            }
+            if (self.config.completion_hook) |hook| {
+                if (try self.callFileHook(a, "completion", hook, f, &.{py.c.PyLong_FromLongLong(offset)})) |list| {
+                    defer py.Py_DecRef(list);
+                    try self.hookItems(a, w, "completion", list, &seen);
                 }
             }
             try w.endArray();
@@ -1240,16 +1587,557 @@ pub const Server = struct {
                 }
             }
         }
+        // The keywords the grammar takes here (all, if it can't tell)
+        const allowed = try self.expectedWords(a, text[0..start]);
         for (self.config.keywords) |k| {
             if (seen.contains(k)) continue;
+            if (allowed) |set| if (!set.contains(k)) continue;
             try w.beginObject();
             try w.fieldString("label", k);
             try w.fieldInt("kind", 14);
             try w.fieldString("sortText", "~");
             try w.endObject();
         }
+        if (self.config.completion_hook) |hook| {
+            if (try self.callFileHook(a, "completion", hook, f, &.{py.c.PyLong_FromLongLong(offset)})) |list| {
+                defer py.Py_DecRef(list);
+                try self.hookItems(a, w, "completion", list, &seen);
+            }
+        }
         try w.endArray();
         try w.endObject();
+    }
+
+    /// The completion items a hook returned (str labels, or dicts of
+    /// CompletionItem fields), written out.
+    fn hookItems(self: *Server, a: Allocator, w: *json.Writer, name: []const u8, list: *PyObject, seen: *std.StringHashMapUnmanaged(void)) !void {
+        const seq = py.c.PySequence_Fast(list, "the hook must return a list") orelse return self.hookFailed(name);
+        defer py.Py_DecRef(seq);
+        const n: usize = @intCast(py.c.PySequence_Size(seq));
+        for (0..n) |i| {
+            const item = py.c.PySequence_GetItem(seq, @intCast(i)) orelse return self.hookFailed(name);
+            defer py.Py_DecRef(item);
+            if (py.PyUnicode_Check(item)) {
+                const label = ph.utf8(item, "label") orelse return self.hookFailed(name);
+                if (seen.contains(label)) continue;
+                try seen.put(a, try a.dupe(u8, label), {});
+                try w.beginObject();
+                try w.fieldString("label", label);
+                try w.endObject();
+            } else if (py.PyDict_Check(item)) {
+                const text = (try pythonToJson(a, item)) orelse return self.hookFailed(name);
+                try w.raw(text);
+            } else {
+                ph.raise(py.PyExc_TypeError(), "the {s} hook's items must be str or dict", .{name});
+                return self.hookFailed(name);
+            }
+        }
+    }
+
+    /// The words the grammar could take after `prefix` (zgram's
+    /// `expected()`); null if it can't tell (an error before).
+    fn expectedWords(self: *Server, a: Allocator, prefix: []const u8) !?std.StringHashMapUnmanaged(void) {
+        if (self.config.keywords.len == 0) return null;
+        const bytes = py.c.PyBytes_FromStringAndSize(prefix.ptr, @intCast(prefix.len)) orelse return error.Python;
+        defer py.Py_DecRef(bytes);
+        const list = py.c.PyObject_CallMethod(self.config.parser, "expected", "O", bytes) orelse {
+            // (a zgram without expected(): every keyword)
+            py.c.PyErr_Clear();
+            return null;
+        };
+        defer py.Py_DecRef(list);
+        const n: usize = @intCast(py.c.PyList_Size(list));
+        if (n == 0) return null;
+        var set: std.StringHashMapUnmanaged(void) = .empty;
+        for (0..n) |i| {
+            const item = py.c.PyList_GetItem(list, @intCast(i));
+            const s = ph.utf8(item, "literal") orelse return error.Python;
+            try set.put(a, try a.dupe(u8, s), {});
+        }
+        return set;
+    }
+
+    /// The inferred types of the definitions in the range that don't write
+    /// theirs (`let x = 1` shows `x: int`); not of functions and types.
+    fn inlayHint(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
+        _ = a;
+        const f = (try self.target(params)) orelse return w.null_();
+        const an = f.analysis.?;
+        const range = json.get(params, "range");
+        const lo = f.doc.offsetOf(readPosition(json.get(range, "start")) orelse return error.InvalidParams, self.encoding);
+        const hi = f.doc.offsetOf(readPosition(json.get(range, "end")) orelse return error.InvalidParams, self.encoding);
+        try w.beginArray();
+        for (an.syms) |*s| {
+            const d = s.def orelse continue;
+            const t = s.type_text orelse continue;
+            if (s.builtin or s.origin_key != null or d.start < lo or d.end > hi) continue;
+            if (t.len == 0 or std.mem.eql(u8, t, "unknown")) continue;
+            switch (self.kindOf(f, s)) {
+                .variable, .constant, .parameter, .field, .property => {},
+                else => continue,
+            }
+            if (hasTypeWritten(an, s.def_node)) continue;
+            try w.beginObject();
+            try w.key("position");
+            try self.writePosition(w, &f.doc, d.end);
+            var buf: [256]u8 = undefined;
+            try w.fieldString("label", std.fmt.bufPrint(&buf, ": {s}", .{t}) catch t);
+            try w.fieldInt("kind", 1);
+            try w.endObject();
+        }
+        try w.endArray();
+    }
+
+    /// Whether the construct defining a name (the name node's parent) has
+    /// a child labelled `type`.
+    fn hasTypeWritten(an: *const Analysis, name_node: u32) bool {
+        if (an.type_field == 0 or name_node == NONE or name_node >= an.parents.len) return false;
+        const p = an.parents[name_node];
+        if (p == NONE) return false;
+        var j: u32 = p + 1;
+        const last = p + an.nodes[p].subtree_size;
+        while (j <= last) : (j += an.nodes[j].subtree_size + 1) {
+            if (an.nodes[j].fieldId() == an.type_field) return true;
+        }
+        return false;
+    }
+
+    /// The definition of the type of the symbol at the position.
+    fn typeDefinition(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
+        _ = a;
+        const at = (try self.symbolAtRequest(params)) orelse return w.null_();
+        const s = (self.definitionOf(at.file, at.sym) orelse Definition{ .file = at.file, .sym = at.sym }).sym;
+        const t = typeName(s.type_text orelse return w.null_());
+        const d = self.typeNamed(at.file, t) orelse return w.null_();
+        try self.writeLocation(w, d.file, d.sym.def.?);
+    }
+
+    /// The definition of a type name seen from `f`: its own or imported
+    /// one, else one defined anywhere in the project.
+    fn typeNamed(self: *Server, f: *File, name: []const u8) ?Definition {
+        if (name.len == 0) return null;
+        if (f.analysis) |an| {
+            for (an.syms) |*s| {
+                if (!std.mem.eql(u8, s.name, name)) continue;
+                if (self.definitionOf(f, s)) |d| return d;
+            }
+        }
+        for (self.project.files.values()) |other| {
+            const an = other.analysis orelse continue;
+            for (an.syms) |*s| {
+                if (s.def == null or s.origin_key != null or !std.mem.eql(u8, s.name, name)) continue;
+                switch (self.kindOf(other, s)) {
+                    .type, .class, .@"struct", .@"enum", .interface => return .{ .file = other, .sym = s },
+                    else => {},
+                }
+            }
+        }
+        return null;
+    }
+
+    /// The signature of the call the cursor is in, with the argument it is
+    /// at: from the callee's type (`fn(int, str) -> bool`) and its
+    /// parameters' names.
+    fn signatureHelp(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
+        const f = (try self.target(params)) orelse return w.null_();
+        const an = f.analysis.?;
+        const text = an.text;
+        const offset = try self.offsetIn(f, params);
+        // Back to the unclosed `(`, counting the commas at its level
+        var depth: usize = 0;
+        var commas: u32 = 0;
+        var i: usize = @min(offset, text.len);
+        const floor = i -| 4096;
+        const open = while (i > floor) {
+            i -= 1;
+            switch (text[i]) {
+                ')', ']', '}' => depth += 1,
+                '[', '{' => {
+                    if (depth == 0) return w.null_();
+                    depth -= 1;
+                },
+                '(' => {
+                    if (depth == 0) break i;
+                    depth -= 1;
+                },
+                ',' => if (depth == 0) {
+                    commas += 1;
+                },
+                ';' => if (depth == 0) return w.null_(),
+                else => {},
+            }
+        } else return w.null_();
+        var name_end = open;
+        while (name_end > 0 and (text[name_end - 1] == ' ' or text[name_end - 1] == '\t')) name_end -= 1;
+        var name_start = name_end;
+        while (name_start > 0 and isWordChar(text[name_start - 1])) name_start -= 1;
+        if (name_start == name_end) return w.null_();
+        const name = text[name_start..name_end];
+
+        // The callee: the name there, else looked up (what's being typed
+        // rarely parses)
+        var callee: ?Ref = null;
+        if (an.symbolAt(@intCast(name_start))) |s| {
+            const d = self.definitionOf(f, s) orelse Definition{ .file = f, .sym = s };
+            callee = .{ .file = d.file, .sym = d.sym };
+        } else if (name_start > 0 and text[name_start - 1] == '.') {
+            if (try self.chainScope(a, f, an, @intCast(name_start - 1))) |scope| callee = self.memberNamed(scope, name);
+        } else callee = try self.visibleNamed(a, f, an, @intCast(name_start), name);
+        const c = callee orelse return w.null_();
+
+        // Its parameters: types from its type, names from its scope
+        var types: std.ArrayList([]const u8) = .empty;
+        var result: ?[]const u8 = null;
+        if (c.sym.type_text) |t| {
+            if (std.mem.startsWith(u8, t, "fn(")) {
+                if (matchingParen(t, 2)) |close| {
+                    var parts = splitTopLevel(t[3..close]);
+                    while (parts.next()) |p| {
+                        const trimmed = std.mem.trim(u8, p, " ");
+                        if (trimmed.len != 0) try types.append(a, trimmed);
+                    }
+                    const rest = std.mem.trim(u8, t[close + 1 ..], " ");
+                    if (std.mem.startsWith(u8, rest, "->")) result = std.mem.trim(u8, rest[2..], " ");
+                }
+            }
+        }
+        var names: std.ArrayList([]const u8) = .empty;
+        if (c.sym.owns != NONE) {
+            if (c.file.analysis) |can| {
+                var ps: std.ArrayList(*const Sym) = .empty;
+                for (can.syms) |*s| {
+                    if (s.scope == c.sym.owns and s.def != null and self.kindOf(c.file, s) == .parameter) try ps.append(a, s);
+                }
+                std.sort.pdq(*const Sym, ps.items, {}, struct {
+                    fn lt(_: void, x: *const Sym, y: *const Sym) bool {
+                        return x.def.?.start < y.def.?.start;
+                    }
+                }.lt);
+                for (ps.items) |s| try names.append(a, s.name);
+            }
+        }
+        const count = @max(types.items.len, names.items.len);
+        if (count == 0 and c.sym.type_text == null) return w.null_();
+
+        var label: std.ArrayList(u8) = .empty;
+        try label.appendSlice(a, c.sym.name);
+        try label.append(a, '(');
+        const Param = struct { start: usize, end: usize };
+        const ranges = try a.alloc(Param, count);
+        for (0..count) |k| {
+            if (k > 0) try label.appendSlice(a, ", ");
+            const start = label.items.len;
+            if (k < names.items.len) try label.appendSlice(a, names.items[k]);
+            if (k < types.items.len) {
+                if (k < names.items.len) try label.appendSlice(a, ": ");
+                try label.appendSlice(a, types.items[k]);
+            }
+            ranges[k] = .{ .start = start, .end = label.items.len };
+        }
+        try label.append(a, ')');
+        if (result) |r| {
+            try label.appendSlice(a, " -> ");
+            try label.appendSlice(a, r);
+        }
+
+        try w.beginObject();
+        try w.key("signatures");
+        try w.beginArray();
+        try w.beginObject();
+        try w.fieldString("label", label.items);
+        if (c.sym.def != null) {
+            if (try self.docComment(a, c.file, c.sym.def.?.start)) |doc| {
+                try w.key("documentation");
+                try w.beginObject();
+                try w.fieldString("kind", "markdown");
+                try w.fieldString("value", doc);
+                try w.endObject();
+            }
+        }
+        try w.key("parameters");
+        try w.beginArray();
+        for (ranges) |r| {
+            // (offsets in the label, in the position encoding's units)
+            const s = self.unitsOf(label.items[0..r.start]);
+            const e = s + self.unitsOf(label.items[r.start..r.end]);
+            try w.beginObject();
+            try w.key("label");
+            try w.beginArray();
+            try w.int(s);
+            try w.int(e);
+            try w.endArray();
+            try w.endObject();
+        }
+        try w.endArray();
+        try w.endObject();
+        try w.endArray();
+        try w.fieldInt("activeSignature", 0);
+        try w.fieldInt("activeParameter", if (count == 0) 0 else @min(commas, count - 1));
+        try w.endObject();
+    }
+
+    fn unitsOf(self: *const Server, s: []const u8) u32 {
+        return switch (self.encoding) {
+            .utf8 => @intCast(s.len),
+            .utf16 => document.byteToUtf16(s),
+        };
+    }
+
+    /// For each position: the word there, then each node around it, out
+    /// to the whole file.
+    fn selectionRange(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
+        const f = (try self.target(params)) orelse return w.null_();
+        const an = f.analysis.?;
+        try w.beginArray();
+        for (json.getArray(params, "positions") orelse return error.InvalidParams) |pos| {
+            const offset = f.doc.offsetOf(readPosition(pos) orelse return error.InvalidParams, self.encoding);
+            var chain: std.ArrayList(Span) = .empty;
+            // The innermost node at the offset, then its ancestors
+            var nodes: std.ArrayList(u32) = .empty;
+            if (an.nodes.len > 0) {
+                var cur: u32 = 0;
+                try nodes.append(a, 0);
+                descend: while (true) {
+                    var j: u32 = cur + 1;
+                    const last = cur + an.nodes[cur].subtree_size;
+                    while (j <= last) : (j += an.nodes[j].subtree_size + 1) {
+                        const n = an.nodes[j];
+                        if (n.text_start <= offset and offset < n.text_end) {
+                            cur = j;
+                            try nodes.append(a, j);
+                            continue :descend;
+                        }
+                    }
+                    break;
+                }
+            }
+            var word = Span{ .start = offset, .end = offset };
+            while (word.start > 0 and isWordChar(an.text[word.start - 1])) word.start -= 1;
+            while (word.end < an.text.len and isWordChar(an.text[word.end])) word.end += 1;
+            if (word.end > word.start) try chain.append(a, word);
+            var k = nodes.items.len;
+            while (k > 0) {
+                k -= 1;
+                const span = an.nodeSpan(nodes.items[k]);
+                if (span.start > word.start or span.end < word.end) continue;
+                if (chain.items.len > 0) {
+                    const prev = chain.items[chain.items.len - 1];
+                    if (prev.start == span.start and prev.end == span.end) continue;
+                }
+                try chain.append(a, span);
+            }
+            const whole = Span{ .start = 0, .end = @intCast(an.text.len) };
+            if (chain.items.len == 0 or chain.items[chain.items.len - 1].start != 0 or chain.items[chain.items.len - 1].end != whole.end) try chain.append(a, whole);
+            for (chain.items, 0..) |span, idx| {
+                try w.beginObject();
+                try w.key("range");
+                try self.writeRange(w, &f.doc, span);
+                if (idx + 1 < chain.items.len) try w.key("parent");
+            }
+            for (chain.items) |_| try w.endObject();
+        }
+        try w.endArray();
+    }
+
+    /// Quick fixes: for a name that isn't defined, the visible ones it may
+    /// be a typo of ("Change to 'count'"); and those of the `code_actions`
+    /// hook.
+    fn codeAction(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
+        const f = (try self.target(params)) orelse return w.null_();
+        const an = f.analysis.?;
+        const range = json.get(params, "range");
+        const lo = f.doc.offsetOf(readPosition(json.get(range, "start")) orelse return error.InvalidParams, self.encoding);
+        const hi = f.doc.offsetOf(readPosition(json.get(range, "end")) orelse return error.InvalidParams, self.encoding);
+        try w.beginArray();
+        for (an.diags) |d| {
+            if (d.span.end < lo or d.span.start > hi) continue;
+            const word = an.text[d.span.start..d.span.end];
+            if (word.len == 0 or !isWordStart(word[0])) continue;
+            for (word) |ch| if (!isWordChar(ch)) break else continue;
+            if (an.symbolAt(d.span.start) != null) continue;
+            for (try self.similarNames(a, f, an, d.span.start, word), 0..) |name, k| {
+                try w.beginObject();
+                try w.fieldString("title", try std.fmt.allocPrint(a, "Change to '{s}'", .{name}));
+                try w.fieldString("kind", "quickfix");
+                if (k == 0) try w.fieldBool("isPreferred", true);
+                try w.key("diagnostics");
+                try w.beginArray();
+                try self.writeDiagnostic(w, f, d);
+                try w.endArray();
+                try w.key("edit");
+                try self.writeEdits(w, f, &.{.{ .span = d.span, .text = name }});
+                try w.endObject();
+            }
+        }
+        if (self.config.code_action_hook) |hook| try self.hookActions(a, w, hook, f, lo, hi);
+        try w.endArray();
+    }
+
+    const Edit = struct { span: Span, text: []const u8 };
+
+    /// A WorkspaceEdit of `edits` in `f`.
+    fn writeEdits(self: *Server, w: *json.Writer, f: *File, edits: []const Edit) !void {
+        try w.beginObject();
+        try w.key("changes");
+        try w.beginObject();
+        try w.key(f.uri);
+        try w.beginArray();
+        for (edits) |e| {
+            try w.beginObject();
+            try w.key("range");
+            try self.writeRange(w, &f.doc, e.span);
+            try w.fieldString("newText", e.text);
+            try w.endObject();
+        }
+        try w.endArray();
+        try w.endObject();
+        try w.endObject();
+    }
+
+    fn writeDiagnostic(self: *Server, w: *json.Writer, f: *File, d: project_mod.Diag) !void {
+        try w.beginObject();
+        try w.key("range");
+        try self.writeRange(w, &f.doc, d.span);
+        try w.fieldInt("severity", d.severity);
+        if (d.code.len != 0) try w.fieldString("code", d.code);
+        try w.fieldString("source", self.config.name);
+        try w.fieldString("message", d.message);
+        try w.endObject();
+    }
+
+    /// The names visible at `at` (the members, after a dot) close to
+    /// `word`: at most 3, the closest first.
+    fn similarNames(self: *Server, a: Allocator, f: *File, an: *const Analysis, at: u32, word: []const u8) ![]const []const u8 {
+        var candidates: std.ArrayList([]const u8) = .empty;
+        if (at > 0 and an.text[at - 1] == '.') {
+            if (try self.chainScope(a, f, an, at - 1)) |scope| {
+                for (scope.file.analysis.?.syms) |*m| {
+                    if (m.scope == scope.node and !m.builtin) try candidates.append(a, m.name);
+                }
+            }
+        } else if (an.checked) |checked| {
+            const list = py.c.PyObject_CallMethod(checked, "visible", "L", @as(c_longlong, at)) orelse return error.Python;
+            defer py.Py_DecRef(list);
+            const n: usize = @intCast(py.c.PyList_Size(list));
+            for (0..n) |i| {
+                const obj = py.c.PyList_GetItem(list, @intCast(i));
+                if ((try ph.attrString(a, obj, "name"))) |name| try candidates.append(a, name);
+            }
+        }
+        const Scored = struct { name: []const u8, dist: usize };
+        var scored: std.ArrayList(Scored) = .empty;
+        const limit = @max(1, (word.len + 1) / 3);
+        outer: for (candidates.items) |name| {
+            if (std.mem.eql(u8, name, word)) continue;
+            for (scored.items) |s| if (std.mem.eql(u8, s.name, name)) continue :outer;
+            const dist = try editDistance(a, word, name);
+            if (dist <= limit) try scored.append(a, .{ .name = name, .dist = dist });
+        }
+        std.sort.pdq(Scored, scored.items, {}, struct {
+            fn lt(_: void, x: Scored, y: Scored) bool {
+                return x.dist < y.dist;
+            }
+        }.lt);
+        const out = try a.alloc([]const u8, @min(3, scored.items.len));
+        for (out, 0..) |*o, i| o.* = scored.items[i].name;
+        return out;
+    }
+
+    /// The code actions of the hook: called with (uri, text, start, end,
+    /// diagnostics, analysis), it returns dicts `{"title", "edits": [(start,
+    /// end, text)], "kind"?, "preferred"?}`.
+    fn hookActions(self: *Server, a: Allocator, w: *json.Writer, hook: *PyObject, f: *File, lo: u32, hi: u32) !void {
+        const an = f.analysis.?;
+        const diags = py.c.PyList_New(0) orelse return error.Python;
+        for (an.diags) |d| {
+            if (d.span.end < lo or d.span.start > hi) continue;
+            const item = py.c.Py_BuildValue("{s:I,s:I,s:L,s:s#,s:s#}", "start", @as(c_uint, d.span.start), "end", @as(c_uint, d.span.end), "severity", @as(c_longlong, d.severity), "code", d.code.ptr, @as(py.Py_ssize_t, @intCast(d.code.len)), "message", d.message.ptr, @as(py.Py_ssize_t, @intCast(d.message.len))) orelse {
+                py.Py_DecRef(diags);
+                return error.Python;
+            };
+            defer py.Py_DecRef(item);
+            if (py.c.PyList_Append(diags, item) != 0) {
+                py.Py_DecRef(diags);
+                return error.Python;
+            }
+        }
+        const result = (try self.callFileHook(a, "code_actions", hook, f, &.{ py.c.PyLong_FromLongLong(lo), py.c.PyLong_FromLongLong(hi), diags })) orelse return;
+        defer py.Py_DecRef(result);
+        self.writeHookActions(a, w, f, result) catch |e| switch (e) {
+            error.Python => return self.hookFailed("code_actions"),
+            else => return e,
+        };
+    }
+
+    fn writeHookActions(self: *Server, a: Allocator, w: *json.Writer, f: *File, result: *PyObject) !void {
+        const seq = py.c.PySequence_Fast(result, "the code_actions hook must return a list") orelse return error.Python;
+        defer py.Py_DecRef(seq);
+        const n: usize = @intCast(py.c.PySequence_Size(seq));
+        const text_len: u32 = @intCast(f.doc.text.items.len);
+        // (all read before any is written: an error leaves no half action)
+        const Action = struct { title: []const u8, kind: []const u8, preferred: bool, edits: []const Edit };
+        var actions: std.ArrayList(Action) = .empty;
+        for (0..n) |i| {
+            const item = py.c.PySequence_GetItem(seq, @intCast(i)) orelse return error.Python;
+            defer py.Py_DecRef(item);
+            const title = try dictString(a, item, "title") orelse {
+                ph.raise(py.PyExc_TypeError(), "a code action needs a 'title'", .{});
+                return error.Python;
+            };
+            const kind = try dictString(a, item, "kind") orelse "quickfix";
+            const preferred = if (py.c.PyDict_GetItemString(item, "preferred")) |p| py.c.PyObject_IsTrue(p) == 1 else false;
+            var edits: std.ArrayList(Edit) = .empty;
+            if (py.c.PyDict_GetItemString(item, "edits")) |list| {
+                const es = py.c.PySequence_Fast(list, "'edits' must be a list") orelse return error.Python;
+                defer py.Py_DecRef(es);
+                const m: usize = @intCast(py.c.PySequence_Size(es));
+                for (0..m) |j| {
+                    const e = py.c.PySequence_GetItem(es, @intCast(j)) orelse return error.Python;
+                    defer py.Py_DecRef(e);
+                    const span = (try ph.toSpan(e)) orelse return error.Python;
+                    const t = py.c.PySequence_GetItem(e, 2) orelse return error.Python;
+                    defer py.Py_DecRef(t);
+                    const s = ph.utf8(t, "an edit's text") orelse return error.Python;
+                    try edits.append(a, .{ .span = .{ .start = @min(span[0], text_len), .end = @min(@max(span[0], span[1]), text_len) }, .text = try a.dupe(u8, s) });
+                }
+            }
+            try actions.append(a, .{ .title = title, .kind = kind, .preferred = preferred, .edits = edits.items });
+        }
+        for (actions.items) |act| {
+            try w.beginObject();
+            try w.fieldString("title", act.title);
+            try w.fieldString("kind", act.kind);
+            if (act.preferred) try w.fieldBool("isPreferred", true);
+            if (act.edits.len != 0) {
+                try w.key("edit");
+                try self.writeEdits(w, f, act.edits);
+            }
+            try w.endObject();
+        }
+    }
+
+    /// The `format` hook's text for the file (called with (uri, text,
+    /// analysis)), as one edit of the whole file.
+    fn formatting(self: *Server, a: Allocator, w: *json.Writer, params: ?Value) !void {
+        const hook = self.config.format_hook orelse return w.null_();
+        const u = json.getString(json.get(params, "textDocument"), "uri") orelse return error.InvalidParams;
+        const f = self.project.get(u) orelse return w.null_();
+        try self.analyze();
+        const result = (try self.callFileHook(a, "format", hook, f, &.{})) orelse return w.null_();
+        defer py.Py_DecRef(result);
+        const text = ph.utf8(result, "the format hook's result") orelse {
+            try self.hookFailed("format");
+            return w.null_();
+        };
+        try w.beginArray();
+        if (!std.mem.eql(u8, text, f.doc.text.items)) {
+            try w.beginObject();
+            try w.key("range");
+            try self.writeRange(w, &f.doc, .{ .start = 0, .end = @intCast(f.doc.text.items.len) });
+            try w.fieldString("newText", text);
+            try w.endObject();
+        }
+        try w.endArray();
     }
 
     /// A symbol and the file it is in
@@ -1357,6 +2245,126 @@ fn readPosition(v: ?Value) ?document.Position {
     const character = json.getInt(v, "character") orelse return null;
     if (line < 0 or character < 0) return null;
     return .{ .line = @intCast(@min(line, std.math.maxInt(u32))), .character = @intCast(@min(character, std.math.maxInt(u32))) };
+}
+
+/// The name of the type a type text is of: `Point` for `Point?`,
+/// `list[Point]` is a `list`, `type[Point]` (a type itself) a `Point`.
+fn typeName(text: []const u8) []const u8 {
+    var t = std.mem.trim(u8, text, " ");
+    if (std.mem.startsWith(u8, t, "type[") and std.mem.endsWith(u8, t, "]")) t = t[5 .. t.len - 1];
+    var end: usize = 0;
+    while (end < t.len and (isWordChar(t[end]) or t[end] == '.')) end += 1;
+    return t[0..end];
+}
+
+/// The index of the `)` closing the `(` at `open`.
+fn matchingParen(text: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    for (text[open..], open..) |c, i| switch (c) {
+        '(', '[', '{' => depth += 1,
+        ')', ']', '}' => {
+            depth -= 1;
+            if (depth == 0) return if (c == ')') i else null;
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Split on the commas outside brackets.
+fn splitTopLevel(text: []const u8) TopLevelSplit {
+    return .{ .text = text };
+}
+
+const TopLevelSplit = struct {
+    text: []const u8,
+    pos: usize = 0,
+    done: bool = false,
+
+    fn next(self: *TopLevelSplit) ?[]const u8 {
+        if (self.done) return null;
+        var depth: usize = 0;
+        var i = self.pos;
+        while (i < self.text.len) : (i += 1) {
+            switch (self.text[i]) {
+                '(', '[', '{' => depth += 1,
+                ')', ']', '}' => depth -|= 1,
+                ',' => if (depth == 0) {
+                    const part = self.text[self.pos..i];
+                    self.pos = i + 1;
+                    return part;
+                },
+                else => {},
+            }
+        }
+        self.done = true;
+        return self.text[self.pos..];
+    }
+};
+
+/// The edits from `x` to `y`: a letter inserted, deleted, replaced, or two
+/// swapped (optimal string alignment).
+fn editDistance(a: Allocator, x: []const u8, y: []const u8) !usize {
+    const width = y.len + 1;
+    const d = try a.alloc(usize, (x.len + 1) * width);
+    for (0..x.len + 1) |i| {
+        for (0..width) |j| {
+            if (i == 0 or j == 0) {
+                d[i * width + j] = i + j;
+                continue;
+            }
+            const cost: usize = if (x[i - 1] == y[j - 1]) 0 else 1;
+            var best = @min(@min(d[(i - 1) * width + j] + 1, d[i * width + j - 1] + 1), d[(i - 1) * width + j - 1] + cost);
+            if (i > 1 and j > 1 and x[i - 1] == y[j - 2] and x[i - 2] == y[j - 1]) best = @min(best, d[(i - 2) * width + j - 2] + 1);
+            d[i * width + j] = best;
+        }
+    }
+    return d[x.len * width + y.len];
+}
+
+/// `d[key]` as a str copied into `a`; null if absent or None.
+fn dictString(a: Allocator, d: *PyObject, key: [*:0]const u8) !?[]const u8 {
+    if (!py.PyDict_Check(d)) {
+        ph.raise(py.PyExc_TypeError(), "a code action must be a dict", .{});
+        return error.Python;
+    }
+    const v = py.c.PyDict_GetItemString(d, key) orelse return null;
+    if (v == py.Py_None()) return null;
+    const s = ph.utf8(v, std.mem.span(key)) orelse return error.Python;
+    return try a.dupe(u8, s);
+}
+
+/// `json.loads(text)`, or null with the error set.
+fn jsonToPython(text: []const u8) ?*PyObject {
+    const mod = py.c.PyImport_ImportModule("json") orelse return null;
+    defer py.Py_DecRef(mod);
+    const s = ph.newString(text) orelse return null;
+    defer py.Py_DecRef(s);
+    return py.c.PyObject_CallMethod(mod, "loads", "O", s);
+}
+
+/// `json.dumps(obj)` copied into `a`, or null with the error set.
+fn pythonToJson(a: Allocator, obj: *PyObject) !?[]const u8 {
+    const mod = py.c.PyImport_ImportModule("json") orelse return null;
+    defer py.Py_DecRef(mod);
+    const s = py.c.PyObject_CallMethod(mod, "dumps", "O", obj) orelse return null;
+    defer py.Py_DecRef(s);
+    const text = ph.utf8(s, "json") orelse return null;
+    return try a.dupe(u8, text);
+}
+
+/// Whether `path` is in the directory `root` (`/a/b/c` is in `/a/b`, `/a/bc`
+/// isn't).
+fn isUnder(path: []const u8, root: []const u8) bool {
+    if (root.len == 0 or path.len <= root.len or !std.mem.startsWith(u8, path, root)) return false;
+    const last = root[root.len - 1];
+    return last == '/' or last == '\\' or path[root.len] == '/' or path[root.len] == '\\';
+}
+
+fn lineStart(text: []const u8, offset: usize) usize {
+    var i = @min(offset, text.len);
+    while (i > 0 and text[i - 1] != '\n') i -= 1;
+    return i;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {

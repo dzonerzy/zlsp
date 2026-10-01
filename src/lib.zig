@@ -16,6 +16,7 @@ const server_mod = @import("server.zig");
 const transport = @import("transport.zig");
 const lsp = @import("lsp.zig");
 const zabi = @import("zrules_abi.zig");
+const textmate_mod = @import("textmate.zig");
 
 const allocator = std.heap.c_allocator;
 const raise = ph.raise;
@@ -60,6 +61,12 @@ const Server = struct {
         comments: ?*PyObject = null,
         folding: ?*PyObject = null,
         keywords: ?*PyObject = null,
+        hover: ?*PyObject = null,
+        completion: ?*PyObject = null,
+        code_actions: ?*PyObject = null,
+        format: ?*PyObject = null,
+        configuration: ?*PyObject = null,
+        log: ?*PyObject = null,
     })) ?Server {
         const v = args.value;
         const state = allocator.create(State) catch return oom(Server);
@@ -81,6 +88,17 @@ const Server = struct {
             return null;
         };
         state.server = server_mod.Server.init(allocator, state.threaded.io(), &state.config) catch return oom(Server);
+        if (optional(v.log)) |l| {
+            const path = utf8(l, "log") orelse {
+                state.server.deinit();
+                return null;
+            };
+            state.server.openLog(path) catch |e| {
+                state.server.deinit();
+                raise(py.PyExc_OSError(), "cannot open the log file '{s}': {s}", .{ path, @errorName(e) });
+                return null;
+            };
+        }
         ok = true;
         return .{ ._state = state };
     }
@@ -134,7 +152,32 @@ const Server = struct {
         return code;
     }
 
-    pub const __doc__: [*:0]const u8 = "Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=None, symbols=None, tokens=None, comments=None, folding=None, keywords=None): a language server for a zgram grammar (and zrules rules). start_io() serves an editor over stdin/stdout; handle(message) runs one JSON-RPC message and returns the messages to send.";
+    /// A TextMate grammar for the language (JSON): its comments, strings,
+    /// numbers and keywords, for VS Code's `contributes.grammars`.
+    pub fn textmate(self: *const Server, args: pyoz.Args(struct { scope: ?*PyObject = null })) ?*PyObject {
+        const state = self._state orelse return notReady();
+        const c = &state.config;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const scope: []const u8 = if (optional(args.value.scope)) |s| utf8(s, "scope") orelse return null else "";
+        const lits = py.c.PyObject_CallMethod(c.parser, "literals", null) orelse return null;
+        defer py.Py_DecRef(lits);
+        const literals = strings(a, lits, "literals") catch |e| return failed(e);
+        const text = textmate_mod.generate(allocator, .{
+            .name = c.name,
+            .scope = scope,
+            .keywords = c.keywords,
+            .literals = literals,
+            .line_comments = c.line_comments,
+            .block_comments = c.block_comments,
+        }) catch |e| return failed(e);
+        defer allocator.free(text);
+        return ph.newString(text);
+    }
+
+    pub const __doc__: [*:0]const u8 = "Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=None, symbols=None, tokens=None, comments=None, folding=None, keywords=None, hover=None, completion=None, code_actions=None, format=None, configuration=None, log=None): a language server for a zgram grammar (and zrules rules). start_io() serves an editor over stdin/stdout; handle(message) runs one JSON-RPC message and returns the messages to send.";
+    pub const textmate__doc__: [*:0]const u8 = "A TextMate grammar for the language, as JSON (comments, strings, numbers, keywords): for an editor extension's syntax highlighting before the server answers. scope defaults to source.<name>.";
     pub const handle__doc__: [*:0]const u8 = "Handle one JSON-RPC message (str or bytes) and return the messages to send (JSON strs), diagnostics included.";
     pub const handle__params__ = "message";
     pub const start_io__doc__: [*:0]const u8 = "Serve an editor over stdin/stdout until it sends exit or closes the input; returns the process exit code.";
@@ -201,6 +244,23 @@ fn configure(state: *State, v: ConfigArgs) error{ Python, OutOfMemory }!void {
         }
         try state.keep(r);
         c.resolve = r;
+    }
+    // Hooks
+    inline for (.{
+        .{ "hover", "hover_hook", "hover(uri, text, offset, analysis) -> str or None" },
+        .{ "completion", "completion_hook", "completion(uri, text, offset, analysis) -> list of str or dict" },
+        .{ "code_actions", "code_action_hook", "code_actions(uri, text, start, end, diagnostics, analysis) -> list of dict" },
+        .{ "format", "format_hook", "format(uri, text, analysis) -> str or None" },
+        .{ "configuration", "configuration_hook", "configuration(settings) -> None" },
+    }) |h| {
+        if (optional(@field(v, h[0]))) |f| {
+            if (py.c.PyCallable_Check(f) == 0) {
+                raise(py.PyExc_TypeError(), "{s} must be callable: {s}", .{ h[0], h[2] });
+                return error.Python;
+            }
+            try state.keep(f);
+            @field(c, h[1]) = f;
+        }
     }
     if (optional(v.name)) |n| c.name = try a.dupe(u8, utf8(n, "name") orelse return error.Python);
     if (optional(v.version)) |n| c.version = try a.dupe(u8, utf8(n, "version") orelse return error.Python);

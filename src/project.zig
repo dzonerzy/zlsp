@@ -46,6 +46,12 @@ pub const Config = struct {
     block_comments: []const [2][]const u8 = &.{},
     /// The grammar's word literals (`let`, `if`)
     keywords: []const []const u8 = &.{},
+    /// Python functions extending the features (see the Server's docs)
+    hover_hook: ?*PyObject = null,
+    completion_hook: ?*PyObject = null,
+    code_action_hook: ?*PyObject = null,
+    format_hook: ?*PyObject = null,
+    configuration_hook: ?*PyObject = null,
 };
 
 /// A zrules Selector's native match function (its capsule, kept alive by
@@ -99,8 +105,11 @@ pub const Analysis = struct {
     token_nodes: []const []const u32 = &.{},
     /// Nodes matched by the fold rules (null: none configured)
     fold_nodes: ?[]const u32 = null,
-    /// The keys of the files it imports (resolved), from the check
+    /// The keys of the files it imports, from the check
     imports: []const []const u8 = &.{},
+    /// The id of the grammar's `type` label (0: none): a definition with a
+    /// child so labelled has its type written out
+    type_field: u8 = 0,
 
     pub fn destroy(self: *Analysis, gpa: Allocator) void {
         if (self.checked) |c| py.Py_DecRef(c);
@@ -147,11 +156,15 @@ pub const File = struct {
     analysis: ?*Analysis = null,
     /// The diagnostics last published (JSON), to publish only changes
     published: ?[]u8 = null,
+    /// The semantic tokens last sent, and their result id (for deltas)
+    tokens: ?[]u32 = null,
+    tokens_id: u64 = 0,
 
     pub fn destroy(self: *File, gpa: Allocator) void {
         if (self.analysis) |a| a.destroy(gpa);
         if (self.tree) |t| py.Py_DecRef(t);
         if (self.published) |p| gpa.free(p);
+        if (self.tokens) |t| gpa.free(t);
         self.doc.deinit();
         gpa.free(self.uri);
         gpa.free(self.id);
@@ -432,6 +445,9 @@ pub const Project = struct {
         const names = try arena.alloc([]const u8, view.rule_count);
         for (names, 0..) |*slot, i| slot.* = view.rule_names.?[i].slice();
         a.rule_names = names;
+        for (0..view.field_count) |i| {
+            if (std.mem.eql(u8, view.field_names.?[i].slice(), "type")) a.type_field = @intCast(i + 1);
+        }
 
         // Diagnostics: the checker's (syntax errors included), or the tree's
         const diag_list = if (a.checked) |c| ph.attr(c, "diagnostics") else ph.attr(tree, "errors");

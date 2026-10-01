@@ -151,17 +151,32 @@ class TestCompletion:
 
     def test_visible_names(self, opened):
         items = self.labels(opened, "fn f(a: int) -> int {\n    let b = a;\n    return b;\n}\nlet later = 1;\n", "return b", 7)
-        # innermost first, the rest after; keywords last
+        # innermost first, the rest after; keywords last: those the grammar
+        # takes there (an expression: not a statement's)
         assert items[:4] == ["a", "b", "f", "later"]
         assert "print" in items and items.index("print") > items.index("later")
-        assert "return" in items and "while" in items
+        assert "not" in items and "true" in items
+        assert "return" not in items and "while" not in items
+
+    def test_keywords_of_a_statement(self, opened):
+        items = self.labels(opened, "fn f() {\n    \n}\n", "    \n", 4)
+        assert {"let", "while", "return", "if"} <= set(items)
+        assert "else" not in items  # (an expression can start a statement: `true` is fine)
+        # after an if's block: `else` too
+        items = self.labels(opened, "fn f() {\n    if true {} \n}\n", "{} ", 3)
+        assert "else" in items and "let" in items
+
+    def test_all_keywords_past_an_error(self, opened):
+        # the grammar can't tell what follows a syntax error: all of them
+        items = self.labels(opened, "let = ;\nfn f() {\n    \n}\n", "    \n", 4)
+        assert "let" in items and "true" in items
 
     def test_items(self, opened):
         opened.change(URI, "fn f(a: int) -> int {\n    return a;\n}\nlet x = f(1);\n")
         result = opened.request("textDocument/completion", opened.at(URI, "f(1)"))
         f = next(i for i in result["items"] if i["label"] == "f")
         assert f["kind"] == 3 and f["detail"] == "fn(int) -> int"
-        kw = next(i for i in result["items"] if i["label"] == "let")
+        kw = next(i for i in result["items"] if i["label"] == "true")
         assert kw["kind"] == 14
 
     def test_members(self, opened):

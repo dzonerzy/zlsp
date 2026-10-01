@@ -16,4 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Folding** of blocks and comment runs; **completion** of visible names, members after `.` through name chains and imports, and keywords.
 - UTF-16 positions, or UTF-8 when the client offers it; incremental document sync; watched-file notifications; `$/cancelRequest`.
 - **`start_io()`**: serves over stdin/stdout, analyzing when the input is idle; `sys.stdout` goes to stderr while it serves. **`handle(message)`** runs one message without I/O.
-- **`examples/tiny`**: a complete server for a small language; **`editors/vscode`**: an extension template.
+- **Signature help**, **inlay hints** (inferred types), **type definition**, **selection ranges**, **code actions** (typo quick fixes for undefined names and members), **doc comments** in hover, **context-aware keyword completion** (zgram's `expected()`), **semantic token deltas**.
+- **Hooks**: `hover=`, `completion=`, `code_actions=`, `format=` (document formatting), `configuration=` (workspace/didChangeConfiguration).
+- **`log=`**: a log file of every message and analysis, timed.
+- **`textmate()`**: a TextMate grammar generated from the grammar and the configuration.
+- **Incremental checking**: an edit checks the edited files, their importers and what those import; an idle analysis gives way to incoming messages.
+- **Workspace folders** added and removed at runtime; files with the same path in two folders kept apart.
+- **`examples/tiny`**: a complete server for a small language; **`editors/vscode`**: an extension template with its TextMate grammar, tested in VS Code; **`editors/neovim/test.lua`**: the same features tested in Neovim.
