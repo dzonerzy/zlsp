@@ -29,6 +29,7 @@ env/
 *.whl
 zig-pkg
 node_modules/
+.vscode-test/
 
 # OS
 .DS_Store

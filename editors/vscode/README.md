@@ -24,3 +24,14 @@ for example:
 ```
 
 The Python that runs it needs zlsp installed (`pip install zlsp-py`).
+
+## Tests
+
+`test/` runs every feature inside a real VS Code (downloaded once into
+`.vscode-test`), through its own LSP client, against `examples/tiny`:
+
+```sh
+ZLSP_PYTHON=$(which python) npm test        # on a headless Linux: xvfb-run -a npm test
+```
+
+CI runs it on every push.

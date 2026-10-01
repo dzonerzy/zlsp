@@ -97,3 +97,44 @@ jobs:
             - name: Run tests
               timeout-minutes: 10
               run: python -m pytest test -v -o faulthandler_timeout=120 --timeout=300
+
+    # The server in a real VS Code: the extension template, its LSP client,
+    # every feature asked of the editor (editors/vscode/test)
+    vscode:
+        name: VS Code
+        needs: build
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - uses: actions/download-artifact@v4
+              with:
+                  name: wheel-Linux
+                  path: dist
+
+            - name: Install zlsp
+              shell: bash
+              run: |
+                  for i in $(seq 10); do
+                      python -m pip install "zgram-py>=0.3.3" "zrules-py>=0.1.4" && break
+                      echo "retrying in 30 s"
+                      sleep 30
+                  done
+                  python -m pip install --no-deps dist/*.whl
+
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: "22"
+
+            - name: Run the extension's tests in VS Code
+              working-directory: editors/vscode
+              run: |
+                  npm ci
+                  ZLSP_PYTHON="$(which python)" xvfb-run -a npm test

@@ -108,6 +108,13 @@ class TestTokens:
         toks = tokens(client)
         assert ('"é😀"', "string", set()) in toks and ("n", "variable", {"declaration"}) in toks
 
+    def test_a_name_only_called_is_a_function(self, tiny_client):
+        # tiny has no types: print, a builtin, is known by how it's used
+        tiny_client.server_legend = legend_of(tiny_client)
+        tiny_client.open(URI, "let x = 1;\nprint(x);\nprint (x);\n")
+        toks = tokens(tiny_client, URI)
+        assert ("print", "function", {"defaultLibrary"}) in toks and ("x", "variable", set()) in toks
+
     def test_multiline_tokens_are_split(self, client):
         client.server_legend = legend_of(client)
         client.open(URI, 'let s = "a\nb";\n')

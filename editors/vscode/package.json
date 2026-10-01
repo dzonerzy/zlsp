@@ -46,7 +46,14 @@
       }
     }
   },
+  "scripts": {
+    "test": "node test/runTest.js"
+  },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "^2.4.1",
+    "mocha": "^10.7.3"
   }
 }

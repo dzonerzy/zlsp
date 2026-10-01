@@ -718,6 +718,18 @@ pub const Server = struct {
             if (std.mem.startsWith(u8, t, "fn(")) return .function;
             if (std.mem.startsWith(u8, t, "type[")) return .type;
         }
+        // Without a type (no types() rule, a builtin): a name only ever
+        // used as `name(...)` is a function
+        if (s.uses.len > 0) {
+            if (f.analysis) |an| {
+                const called = for (s.uses) |u| {
+                    var i: usize = u.end;
+                    while (i < an.text.len and (an.text[i] == ' ' or an.text[i] == '\t')) i += 1;
+                    if (i >= an.text.len or an.text[i] != '(') break false;
+                } else true;
+                if (called) return .function;
+            }
+        }
         return .variable;
     }
 
