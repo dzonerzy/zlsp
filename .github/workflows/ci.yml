@@ -138,3 +138,41 @@ jobs:
               run: |
                   npm ci
                   ZLSP_PYTHON="$(which python)" xvfb-run -a npm test
+
+    # The server in a real Neovim, set up as the README says
+    # (editors/neovim/test.lua)
+    neovim:
+        name: Neovim
+        needs: build
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - uses: actions/download-artifact@v4
+              with:
+                  name: wheel-Linux
+                  path: dist
+
+            - name: Install zlsp
+              shell: bash
+              run: |
+                  for i in $(seq 10); do
+                      python -m pip install "zgram-py>=0.3.3" "zrules-py>=0.1.4" && break
+                      echo "retrying in 30 s"
+                      sleep 30
+                  done
+                  python -m pip install --no-deps dist/*.whl
+
+            - name: Install Neovim
+              run: |
+                  curl -sL -o /tmp/nvim.tar.gz https://github.com/neovim/neovim/releases/download/v0.11.4/nvim-linux-x86_64.tar.gz
+                  tar xzf /tmp/nvim.tar.gz -C /tmp
+
+            - name: Run the session
+              run: ZLSP_PYTHON="$(which python)" /tmp/nvim-linux-x86_64/bin/nvim --headless -u NONE -l editors/neovim/test.lua
