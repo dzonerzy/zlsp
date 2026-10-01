@@ -13,8 +13,8 @@ checked = []
 
 
 def record(node, ctx):
-    # each file starts with `# <name>`
-    checked.append(node.text().split("\n", 1)[0][2:])
+    # each file starts with `# <name>` (written with \r\n on Windows)
+    checked.append(node.text().split("\n", 1)[0][2:].rstrip("\r"))
 
 
 RULES = Rules(typed.PARSER, typed.STRUCTURE + [scopes(**typed.SCOPES), types(**typed.TYPES), flow(**typed.FLOW), custom("program", record)])
