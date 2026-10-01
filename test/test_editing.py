@@ -5,7 +5,8 @@ folders and the configuration; the log; the TextMate grammar."""
 import json
 
 import pytest
-from conftest import Client, typed_server, uri_of
+import zlsp
+from conftest import TYPED_CONFIG, Client, typed_server, uri_of
 
 URI = "file:///a.ty"
 
@@ -267,11 +268,92 @@ class TestHooks:
         with pytest.raises(TypeError, match="hover must be callable"):
             typed_server(hover=1)
 
-    def test_configuration(self):
+    def test_a_hook_must_be_callable(self):
+        with pytest.raises(TypeError, match="configuration must be callable"):
+            typed_server(configuration="x")
+
+
+class TestConfiguration:
+    def test_pushed(self):
+        # a client that can't be asked: the settings it sends, the section's
         got = []
         c = opened(typed_server(configuration=got.append))
-        c.notify("workspace/didChangeConfiguration", {"settings": {"typed": {"strict": True}}})
-        assert got == [{"typed": {"strict": True}}]
+        c.notify("workspace/didChangeConfiguration", {"settings": {"typed": {"strict": True}, "other": 1}})
+        c.notify("workspace/didChangeConfiguration", {"settings": {"strict": False}})
+        c.notify("workspace/didChangeConfiguration", {"settings": None})
+        assert got == [{"strict": True}, {"strict": False}]
+
+    def test_pulled(self):
+        # a client that can: asked once initialized, and on each change
+        got = []
+        c = Client(typed_server(configuration=got.append, section="ty"))
+        c.initialize(workspace={"configuration": True, "didChangeConfiguration": {"dynamicRegistration": True}})
+        registration = next(r for r in c.requests if r["method"] == "client/registerCapability")
+        regs = registration["params"]["registrations"]
+        assert {"id": "zlsp-settings", "method": "workspace/didChangeConfiguration", "registerOptions": {"section": "ty"}} in regs
+        ask = next(r for r in c.requests if r["method"] == "workspace/configuration")
+        assert ask["params"] == {"items": [{"section": "ty"}]}
+        c._send({"jsonrpc": "2.0", "id": ask["id"], "result": [{"strict": True}]})
+        assert got == [{"strict": True}]
+        c.requests.clear()
+        c.notify("workspace/didChangeConfiguration", {"settings": None})
+        again = next(r for r in c.requests if r["method"] == "workspace/configuration")
+        c._send({"jsonrpc": "2.0", "id": again["id"], "result": [None]})
+        assert got == [{"strict": True}, None]
+
+    def test_not_asked_without_the_hook(self):
+        c = Client(typed_server())
+        c.initialize(workspace={"configuration": True, "didChangeConfiguration": {"dynamicRegistration": True}})
+        assert [r for r in c.requests if r["method"] == "workspace/configuration"] == []
+
+    def test_the_settings_change_the_diagnostics(self):
+        # a custom rule reads the settings; the project is checked again
+        import typed
+        from zrules import Rules, custom, scopes
+
+        settings = {"short": False}
+
+        def short_names(node, ctx):
+            if settings["short"] and len(node.text()) < 3:
+                ctx.warning(node, "a short name", code="short-name")
+
+        rules = Rules(typed.PARSER, [scopes(**typed.SCOPES), custom("let_stmt > .name", short_names)])
+        server = zlsp.Server(typed.PARSER, rules, **TYPED_CONFIG, configuration=lambda s: settings.update(s or {}))
+        c = opened(server, text="let ab = 1;\nlet abc = ab;\n")
+        assert c.diagnostics[URI] == []
+        c.notify("workspace/didChangeConfiguration", {"settings": {"typed": {"short": True}}})
+        c.request("textDocument/hover", c.at(URI, "abc"))  # (the analysis runs when idle)
+        assert [d["code"] for d in c.diagnostics[URI]] == ["short-name"]
+
+
+class TestTrace:
+    def traces(self, c):
+        out = [n["params"] for n in c.notifications if n["method"] == "$/logTrace"]
+        c.notifications.clear()
+        return out
+
+    def test_off_by_default(self):
+        c = opened()
+        c.request("textDocument/hover", c.at(URI, "count"))
+        assert self.traces(c) == []
+
+    def test_messages_and_verbose(self):
+        c = Client(typed_server())
+        c._send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"capabilities": {}, "trace": "messages"}})
+        c.notify("initialized", {})
+        c.open(URI, SRC)
+        c.request("textDocument/hover", c.at(URI, "count"))
+        t = self.traces(c)
+        assert any(x["message"].startswith("analysis analyzed in ") and x["message"].endswith("1 of 1 files checked") for x in t), t
+        assert any(x["message"].startswith("textDocument/hover answered in ") for x in t), t
+        assert all("verbose" not in x for x in t)
+        c.notify("$/setTrace", {"value": "verbose"})
+        c.change(URI, SRC + "let more = 1;\n")
+        t = self.traces(c)
+        assert any(x.get("verbose") == "a" for x in t), t  # (the files checked)
+        c.notify("$/setTrace", {"value": "off"})
+        c.change(URI, SRC)
+        assert self.traces(c) == []
 
 
 class TestWorkspaceFolders:
@@ -305,6 +387,39 @@ class TestWorkspaceFolders:
         symbols = c.request("workspace/symbol", {"query": "value"})
         assert sorted(s["containerName"] for s in symbols) == ["lib", "server/lib"]
         assert sorted(s["location"]["uri"] for s in symbols) == sorted([uri_of(tmp_path / "client" / "lib.ty"), uri_of(tmp_path / "server" / "lib.ty")])
+
+    @pytest.mark.parametrize("resolve", [None, lambda module, importer: module])
+    def test_imports_resolve_in_the_importers_folder(self, tmp_path, resolve):
+        # client/lib.ty's value is an int, server/lib.ty's a str: each main
+        # gets its own folder's, its type says which
+        for name, value in (("client", "1"), ("server", '"s"')):
+            d = tmp_path / name
+            d.mkdir()
+            (d / "lib.ty").write_text(f"let value = {value};\n")
+            (d / "main.ty").write_text("from lib import value;\nlet v = value;\n")
+        c = Client(typed_server(resolve=resolve))
+        c.initialize(folders=[uri_of(tmp_path / "client"), uri_of(tmp_path / "server")])
+        for name, t in (("client", "int"), ("server", "str")):
+            uri = uri_of(tmp_path / name / "main.ty")
+            c.open(uri, "from lib import value;\nlet v = value;\n")
+            assert c.diagnostics[uri] == []
+            hover = c.request("textDocument/hover", c.at(uri, "v ="))["contents"]["value"]
+            assert f"v: {t}" in hover, hover
+            loc = c.request("textDocument/definition", c.at(uri, "value;", occurrence=1))
+            assert loc["uri"] == uri_of(tmp_path / name / "lib.ty")
+
+    def test_an_import_from_another_folder(self, tmp_path):
+        # a path only one folder has resolves there, from any folder
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        (tmp_path / "a" / "lib.ty").write_text("let value = 1;\n")
+        (tmp_path / "b" / "lib.ty").write_text("let other = 2;\n")
+        (tmp_path / "a" / "shared.ty").write_text("let s = 1;\n")
+        c = Client(typed_server())
+        c.initialize(folders=[uri_of(tmp_path / "a"), uri_of(tmp_path / "b")])
+        uri = uri_of(tmp_path / "b" / "main.ty")
+        c.open(uri, "from shared import s;\nfrom lib import other;\nlet v = s + other;\n")
+        assert c.diagnostics[uri] == []
 
 
 class TestLog:

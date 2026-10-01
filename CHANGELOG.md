@@ -21,5 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`log=`**: a log file of every message and analysis, timed.
 - **`textmate()`**: a TextMate grammar generated from the grammar and the configuration.
 - **Incremental checking**: an edit checks the edited files, their importers and what those import; an idle analysis gives way to incoming messages.
-- **Workspace folders** added and removed at runtime; files with the same path in two folders kept apart.
-- **`examples/tiny`**: a complete server for a small language; **`editors/vscode`**: an extension template with its TextMate grammar, tested in VS Code; **`editors/neovim/test.lua`**: the same features tested in Neovim.
+- **Workspace folders** added and removed at runtime; files with the same path in two folders kept apart, an import resolving in the importing file's folder.
+- **Settings**: asked of the editor (`workspace/configuration`) at start and on each change, for the `configuration` hook (`section=`); pushed settings for editors that can't be asked.
+- **Tracing**: `$/setTrace` and `$/logTrace` with each request's and analysis's time.
+- **`examples/tiny`**: a complete server for a small language, using every hook; **`editors/vscode`**: an extension template with its TextMate grammar, tested in VS Code; **`editors/neovim/test.lua`**: the same features tested in Neovim.

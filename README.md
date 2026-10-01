@@ -138,7 +138,7 @@ Both are tested for real: the VS Code extension's suite runs in VS Code, and [`e
 Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=None,
        symbols=None, tokens=None, comments=None, folding=None, keywords=None,
        hover=None, completion=None, code_actions=None, format=None, configuration=None,
-       log=None)
+       section=None, log=None)
 ```
 
 | Option | |
@@ -154,7 +154,8 @@ Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=
 | `folding` | selectors of the foldable nodes; by default every node with children that spans lines |
 | `keywords` | the keywords, for highlighting and completion; by default the grammar's word literals (`parser.literals()`) |
 | `hover`, `completion`, `code_actions`, `format`, `configuration` | Python functions extending the features (see Hooks) |
-| `log` | a file to log to: every message in and out, and each analysis with its time (created, or emptied, when the server starts) |
+| `section` | the settings the `configuration` hook gets: `tiny` for the editor's `tiny.*` settings; by default the `name` |
+| `log` | a file to log to: every message in and out, each request and analysis with its time (created, or emptied, when the server starts) |
 
 Selectors are zrules selectors. Names defined without a configured kind show as functions if their type is a function's, as types if they name a type, as functions if they are only ever called, and as variables otherwise.
 
@@ -181,11 +182,16 @@ def format(uri, text, analysis):
     """The formatted text (None: leave it). With this hook the server offers formatting."""
 
 def configuration(settings):
-    """The editor's settings changed (workspace/didChangeConfiguration). The
-    project is checked again afterwards: a hook can change what the rules do."""
+    """The settings of the section (a dict, or None if there are none): when
+    the server starts, and each time they change. The project is checked
+    again afterwards: a hook can change what the rules do."""
 ```
 
+The server asks the editor for the settings (`workspace/configuration`) once it's initialized and whenever the editor says they changed (it registers for `workspace/didChangeConfiguration`). An editor that can't be asked gets the settings it sends with its notifications: the section's, if they have it.
+
 A hook raising an exception doesn't fail the request: the editor gets the error in its log, and the feature works without the hook.
+
+The tiny example uses each of them: the builtins' docs in hover, snippets where the grammar takes a statement (`parser.expected()`), a quick fix removing a stray `break`, a formatter, and a `tiny.maxLineLength` setting read by a rule of its own.
 
 ## TextMate grammar
 
@@ -211,7 +217,9 @@ A hook raising an exception doesn't fail the request: the editor gets the error 
 
 **Completion.** The names a name written at the cursor could refer to, by the scope rules (ordering, hoisting, imports), innermost first, then builtins, then keywords: those the grammar takes at the cursor (zgram's `parser.expected()`; all of them after a syntax error, where it can't tell). After a `.`, the members of what the name chain before it stands for: a struct's fields and methods, a module's names, the fields of a variable's type. The chain is read from the text, since the line being typed rarely parses.
 
-**Workspace.** The files of every workspace folder, folders added and removed while the editor runs. A file's key is its path under its folder; two folders with the same path (`client/lib.ty`, `server/lib.ty`) keep their files apart: the second is known by its folder's name too (`server/lib`).
+**Workspace.** The files of every workspace folder, folders added and removed while the editor runs. A file's key is its path under its folder; two folders with the same path (`client/lib.ty`, `server/lib.ty`) keep their files apart: the second is known by its folder's name too (`server/lib`). An import of `lib` then means the importing file's own folder's (after `resolve`, if given); a path only one folder has resolves there from any folder.
+
+**Tracing.** When the editor traces the server (`$/setTrace`, VS Code's `<language>.trace.server`), it gets each request's time and each analysis's (how many files it checked, and which when the trace is verbose) as `$/logTrace`. The `log=` file has them too.
 
 **Positions** are in UTF-16 code units, as LSP expects, or UTF-8 when the editor offers it.
 

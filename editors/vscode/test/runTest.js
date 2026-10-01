@@ -26,6 +26,7 @@ async function main() {
   );
   fs.writeFileSync(path.join(workspace, "clean.tiny"), "let x = 1;\nprint(x);\n");
   fs.writeFileSync(path.join(workspace, "broken.tiny"), "let y = ;\nprint(y);\n");
+  fs.writeFileSync(path.join(workspace, "messy.tiny"), "fn f(a) {\nreturn a;   \n}\nprint(f(1));\n");
   fs.mkdirSync(path.join(workspace, ".vscode"));
   fs.writeFileSync(
     path.join(workspace, ".vscode", "settings.json"),

@@ -6,15 +6,19 @@ checks it, zlsp serves it to an editor.
 
 The editor gets, as you type: syntax errors (every one, not just the first),
 'break' outside a loop, 'return' outside a function, undefined and duplicate
-names; go to definition, find references, rename, hover, the outline,
-highlighting, folding and completion.
+names; go to definition, find references, rename, hover, signature help,
+quick fixes, the outline, highlighting, folding and completion.
+
+The hooks at the end add what only the language knows: the builtins' docs in
+hover, snippets in completion, a quick fix that removes a stray 'break', a
+formatter, and a setting (tiny.maxLineLength) for a rule of its own.
 """
 
 import sys
 
 import zgram
 from zlsp import Server
-from zrules import Rules, forbid, inside, scopes
+from zrules import Rules, custom, forbid, inside, scopes
 
 GRAMMAR = r"""
 program     = ws (body:stmt ws)*                                      -> Program
@@ -52,6 +56,22 @@ mulop "operator"   = [*/%]                                            -> str
 
 PARSER = zgram.compile(GRAMMAR)
 
+# The editor's settings for tiny (`tiny.*`), from the configuration hook
+SETTINGS = {"maxLineLength": 0}
+
+
+def long_lines(node, ctx):
+    """A warning on each line longer than tiny.maxLineLength (0: off)."""
+    limit = SETTINGS["maxLineLength"]
+    if not limit:
+        return
+    at = node.start()
+    for line in node.text().encode().split(b"\n"):
+        if len(line.decode(errors="replace")) > limit:
+            ctx.warning((at, at + len(line)), f"line longer than {limit} characters", code="line-too-long")
+        at += len(line) + 1
+
+
 RULES = Rules(
     PARSER,
     [
@@ -71,8 +91,98 @@ RULES = Rules(
             builtins=("print",),
             on_unused="warning",
         ),
+        custom("Program", long_lines),
     ],
 )
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+
+BUILTIN_DOCS = {"print": "Writes its arguments, separated by spaces, then a new line."}
+
+
+def hover(uri, text, offset, analysis):
+    """The docs of a builtin, below what the server shows of it."""
+    data = text.encode()
+    start = end = offset
+    while start > 0 and (data[start - 1 : start].isalnum() or data[start - 1 : start] == b"_"):
+        start -= 1
+    while end < len(data) and (data[end : end + 1].isalnum() or data[end : end + 1] == b"_"):
+        end += 1
+    return BUILTIN_DOCS.get(data[start:end].decode())
+
+
+SNIPPETS = {
+    "fn": "fn ${1:name}(${2}) {\n\t$0\n}",
+    "while": "while ${1:condition} {\n\t$0\n}",
+    "if": "if ${1:condition} {\n\t$0\n}",
+}
+
+
+def completion(uri, text, offset, analysis):
+    """Snippets for the statements with a block, where the grammar takes
+    their keyword (zgram's expected(), given the text before the word)."""
+    data = text.encode()
+    start = offset
+    while start > 0 and (data[start - 1 : start].isalnum() or data[start - 1 : start] == b"_"):
+        start -= 1
+    allowed = PARSER.expected(data[:start]) or SNIPPETS
+    return [{"label": k, "kind": 15, "detail": f"{k} ... {{ }}", "insertText": v, "insertTextFormat": 2} for k, v in SNIPPETS.items() if k in allowed]
+
+
+def code_actions(uri, text, start, end, diagnostics, analysis):
+    """Removing a 'break' outside a loop: the statement and its line, if it's alone there."""
+    actions = []
+    data = text.encode()
+    for d in diagnostics:
+        if d["code"] != "break-outside-loop":
+            continue
+        s, e = d["start"], d["end"]
+        line_start = data.rfind(b"\n", 0, s) + 1
+        line_end = data.find(b"\n", e)
+        line_end = len(data) if line_end < 0 else line_end + 1
+        if not data[line_start:s].strip() and not data[e:line_end].strip():
+            s, e = line_start, line_end
+        actions.append({"title": "Remove the 'break'", "edits": [(s, e, "")], "preferred": True})
+    return actions
+
+
+def format(uri, text, analysis):
+    """Indents by 4 spaces a level of braces (outside strings and comments);
+    no trailing spaces; one new line at the end."""
+    out = []
+    depth = 0
+    for raw in text.split("\n"):
+        line = raw.strip()
+        code = _code_of(line)
+        closing = len(code) - len(code.lstrip("}"))
+        level = max(depth - closing, 0)
+        out.append("    " * level + line if line else "")
+        depth = max(depth + code.count("{") - code.count("}"), 0)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _code_of(line):
+    """The line without its strings and comment."""
+    code, quoted, escaped = [], False, False
+    for ch in line:
+        if quoted:
+            quoted = escaped or ch != '"'
+            escaped = not escaped and ch == "\\"
+        elif ch == '"':
+            quoted = True
+        elif ch == "#":
+            break
+        else:
+            code.append(ch)
+    return "".join(code)
+
+
+def configuration(settings):
+    """The editor's tiny.* settings changed."""
+    settings = settings or {}
+    SETTINGS["maxLineLength"] = int(settings.get("maxLineLength") or 0)
 
 
 def make_server():
@@ -85,6 +195,11 @@ def make_server():
         symbols={"FuncDef > .name": "function", "FuncDef > .params": "parameter", "Let > .name": "variable"},
         tokens={"number": "number", "string": "string", "cmpop, addop, mulop": "operator"},
         comments=["#"],
+        hover=hover,
+        completion=completion,
+        code_actions=code_actions,
+        format=format,
+        configuration=configuration,
     )
 
 

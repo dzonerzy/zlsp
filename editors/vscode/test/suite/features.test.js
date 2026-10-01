@@ -94,6 +94,13 @@ suite("zlsp in VS Code", function () {
     assert.match(text, /A program with mistakes/);
   });
 
+  test("hover: the hook's docs of a builtin", async () => {
+    const hovers = await vscode.commands.executeCommand("vscode.executeHoverProvider", doc.uri, pos(12, 2));
+    const text = hovers.flatMap((h) => h.contents.map((c) => c.value || c)).join("\n");
+    assert.match(text, /function print/);
+    assert.match(text, /Writes its arguments/);
+  });
+
   test("signature help", async () => {
     const help = await vscode.commands.executeCommand("vscode.executeSignatureHelpProvider", doc.uri, pos(9, 24));
     assert.strictEqual(help.signatures[0].label, "fib(n)");
@@ -127,6 +134,41 @@ suite("zlsp in VS Code", function () {
     for (const name of ["fib", "total", "i", "print"]) assert.ok(labels.includes(name), `${name} in ${labels}`);
     // an argument: no statement keywords
     assert.ok(!labels.includes("while"), labels.join());
+    // the hook's snippets: where a statement can start
+    const snippets = async (p) => {
+      const l = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", doc.uri, p);
+      return l.items.filter((i) => i.kind === vscode.CompletionItemKind.Snippet);
+    };
+    assert.deepStrictEqual(await snippets(pos(12, 6)), []);
+    const fn = (await snippets(pos(5, 0))).find((i) => (i.label.label || i.label) === "fn");
+    assert.ok(fn, "the fn snippet");
+    assert.ok(fn.insertText instanceof vscode.SnippetString);
+  });
+
+  test("a code action from the hook", async () => {
+    const actions = await vscode.commands.executeCommand("vscode.executeCodeActionProvider", doc.uri, new vscode.Range(pos(13, 0), pos(13, 5)));
+    const remove = actions.find((a) => a.title === "Remove the 'break'");
+    assert.ok(remove, actions.map((a) => a.title).join());
+    const [edit] = remove.edit.get(doc.uri);
+    assert.deepStrictEqual([edit.range.start.line, edit.range.end.line, edit.newText], [13, 14, ""]);
+  });
+
+  test("formatting, by the hook", async () => {
+    const messy = await vscode.workspace.openTextDocument(fileUri("messy.tiny"));
+    const edits = await vscode.commands.executeCommand("vscode.executeFormatDocumentProvider", messy.uri, { tabSize: 4, insertSpaces: true });
+    // (VS Code makes the whole-file edit minimal: applied, it gives the text)
+    const edit = new vscode.WorkspaceEdit();
+    edit.set(messy.uri, edits);
+    await vscode.workspace.applyEdit(edit);
+    assert.strictEqual(messy.getText(), "fn f(a) {\n    return a;\n}\nprint(f(1));\n");
+  });
+
+  test("a setting, asked of VS Code", async () => {
+    const settings = vscode.workspace.getConfiguration("tiny");
+    await settings.update("maxLineLength", 30, vscode.ConfigurationTarget.Workspace);
+    await waitFor("the long line's warning", () => codes(doc.uri).includes("3:line-too-long"));
+    await settings.update("maxLineLength", undefined, vscode.ConfigurationTarget.Workspace);
+    await waitFor("no more", () => !codes(doc.uri).includes("3:line-too-long"));
   });
 
   test("semantic highlighting", async () => {

@@ -49,6 +49,22 @@
             "tiny.py"
           ],
           "description": "Its arguments: the script that calls zlsp's Server(...).start_io()."
+        },
+        "tiny.maxLineLength": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "Warn about lines longer than this (0: never). The server asks for it (workspace/configuration) and hears of its changes."
+        },
+        "tiny.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the messages between VS Code and the server, with the server's timings, in the 'tiny language server' output."
         }
       }
     }

@@ -67,6 +67,7 @@ const Server = struct {
         format: ?*PyObject = null,
         configuration: ?*PyObject = null,
         log: ?*PyObject = null,
+        section: ?*PyObject = null,
     })) ?Server {
         const v = args.value;
         const state = allocator.create(State) catch return oom(Server);
@@ -176,7 +177,7 @@ const Server = struct {
         return ph.newString(text);
     }
 
-    pub const __doc__: [*:0]const u8 = "Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=None, symbols=None, tokens=None, comments=None, folding=None, keywords=None, hover=None, completion=None, code_actions=None, format=None, configuration=None, log=None): a language server for a zgram grammar (and zrules rules). start_io() serves an editor over stdin/stdout; handle(message) runs one JSON-RPC message and returns the messages to send.";
+    pub const __doc__: [*:0]const u8 = "Server(parser, rules=None, *, name=None, version=None, extensions=None, resolve=None, symbols=None, tokens=None, comments=None, folding=None, keywords=None, hover=None, completion=None, code_actions=None, format=None, configuration=None, section=None, log=None): a language server for a zgram grammar (and zrules rules). start_io() serves an editor over stdin/stdout; handle(message) runs one JSON-RPC message and returns the messages to send.";
     pub const textmate__doc__: [*:0]const u8 = "A TextMate grammar for the language, as JSON (comments, strings, numbers, keywords): for an editor extension's syntax highlighting before the server answers. scope defaults to source.<name>.";
     pub const handle__doc__: [*:0]const u8 = "Handle one JSON-RPC message (str or bytes) and return the messages to send (JSON strs), diagnostics included.";
     pub const handle__params__ = "message";
@@ -263,6 +264,8 @@ fn configure(state: *State, v: ConfigArgs) error{ Python, OutOfMemory }!void {
         }
     }
     if (optional(v.name)) |n| c.name = try a.dupe(u8, utf8(n, "name") orelse return error.Python);
+    c.section = c.name;
+    if (optional(v.section)) |n| c.section = try a.dupe(u8, utf8(n, "section") orelse return error.Python);
     if (optional(v.version)) |n| c.version = try a.dupe(u8, utf8(n, "version") orelse return error.Python);
 
     if (optional(v.extensions)) |e| {

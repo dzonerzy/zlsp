@@ -50,6 +50,10 @@ pub const Server = struct {
     /// Keywords, for lookups
     keywords: std.StringHashMapUnmanaged(void) = .empty,
     next_request_id: i64 = 1,
+    /// The client's trace setting ($/setTrace): what to send as $/logTrace
+    trace_level: enum { off, messages, verbose } = .off,
+    /// The id of our workspace/configuration request awaiting its answer
+    settings_request: ?i64 = null,
     /// For the semantic tokens' result ids
     next_result_id: u64 = 1,
     /// The log file (`log=` in Python): every message in and out, and the
@@ -63,6 +67,10 @@ pub const Server = struct {
         hierarchical_symbols: bool = false,
         related_information: bool = false,
         watched_files: bool = false,
+        /// workspace/configuration (pulling settings), and registering for
+        /// workspace/didChangeConfiguration
+        configuration: bool = false,
+        configuration_changes: bool = false,
     } = .{},
 
     pub fn init(gpa: Allocator, io: std.Io, config: *const Config) !Server {
@@ -94,6 +102,37 @@ pub const Server = struct {
         self.log_start = std.Io.Clock.awake.now(self.io).toMilliseconds();
     }
 
+    fn micros(self: *const Server) i64 {
+        return @intCast(@divTrunc(std.Io.Clock.awake.now(self.io).toNanoseconds(), 1000));
+    }
+
+    fn setTrace(self: *Server, value: ?[]const u8) void {
+        const v = value orelse return;
+        self.trace_level = if (std.mem.eql(u8, v, "verbose")) .verbose else if (std.mem.eql(u8, v, "messages")) .messages else .off;
+    }
+
+    /// $/logTrace, if the client traces: `message`, and `verbose` too if it
+    /// traces verbosely. Also in the log file.
+    fn logTrace(self: *Server, message: []const u8, verbose: ?[]const u8) !void {
+        self.trace("{s}", .{message});
+        if (self.trace_level == .off) return;
+        var w = json.Writer.init(self.gpa);
+        defer w.deinit();
+        try w.beginObject();
+        try w.fieldString("jsonrpc", "2.0");
+        try w.fieldString("method", "$/logTrace");
+        try w.key("params");
+        try w.beginObject();
+        try w.fieldString("message", message);
+        if (self.trace_level == .verbose) {
+            if (verbose) |v| try w.fieldString("verbose", v);
+        }
+        try w.endObject();
+        try w.endObject();
+        // (not through send(): its own log line would repeat the message)
+        try self.out.append(self.gpa, try w.toOwned());
+    }
+
     fn millis(self: *const Server) i64 {
         return std.Io.Clock.awake.now(self.io).toMilliseconds();
     }
@@ -121,7 +160,18 @@ pub const Server = struct {
         const params = json.get(msg, "params");
         const id: ?[]const u8 = if (id_value) |v| try std.json.Stringify.valueAlloc(a, v, .{}) else null;
 
-        const m = method orelse return; // a response to one of our requests
+        const m = method orelse {
+            // A response to one of our requests
+            const req_id = id orelse return;
+            if (self.settings_request) |sid| {
+                if (std.mem.eql(u8, req_id, try std.fmt.allocPrint(a, "{d}", .{sid}))) {
+                    self.settings_request = null;
+                    const items = json.getArray(msg, "result") orelse return;
+                    if (items.len > 0) try self.applySettings(items[0]);
+                }
+            }
+            return;
+        };
         if (id) |req_id| {
             if (self.cancelled.fetchRemove(req_id)) |kv| {
                 self.gpa.free(kv.key);
@@ -165,9 +215,23 @@ pub const Server = struct {
     fn analyzeWith(self: *Server, interrupt: ?project_mod.Project.Interrupt) !project_mod.Project.Outcome {
         var buf: [512]u8 = undefined;
         var len: usize = 0;
-        const t0 = if (self.log_file != null) self.millis() else 0;
+        const t0 = self.micros();
         const outcome = try self.project.analyze(&buf, &len, interrupt);
-        if (outcome != .unchanged) self.trace("analysis {s} in {d} ms ({d} files)", .{ @tagName(outcome), self.millis() - t0, self.project.files.count() });
+        if (outcome != .unchanged and (self.log_file != null or self.trace_level != .off)) {
+            const us = self.micros() - t0;
+            const msg = try std.fmt.allocPrint(self.gpa, "analysis {s} in {d}.{d:0>3} ms: {d} of {d} files checked", .{ @tagName(outcome), @divTrunc(us, 1000), @as(u64, @intCast(@mod(us, 1000))), self.project.last_checked, self.project.files.count() });
+            defer self.gpa.free(msg);
+            var keys: std.ArrayList(u8) = .empty;
+            defer keys.deinit(self.gpa);
+            if (self.trace_level == .verbose) {
+                for (self.project.files.values()) |f| {
+                    if (f.checked_at != self.project.analyzed) continue;
+                    if (keys.items.len != 0) try keys.appendSlice(self.gpa, ", ");
+                    try keys.appendSlice(self.gpa, f.key);
+                }
+            }
+            try self.logTrace(msg, if (keys.items.len != 0) keys.items else null);
+        }
         if (outcome != .failed) return outcome;
         const text = buf[0..len];
         if (self.project.last_failure) |prev| {
@@ -207,6 +271,14 @@ pub const Server = struct {
         };
         for (table) |entry| {
             if (!std.mem.eql(u8, entry[0], method)) continue;
+            const t0 = self.micros();
+            defer if (self.trace_level != .off or self.log_file != null) {
+                const us = self.micros() - t0;
+                if (std.fmt.allocPrint(self.gpa, "{s} answered in {d}.{d:0>3} ms", .{ method, @divTrunc(us, 1000), @as(u64, @intCast(@mod(us, 1000))) })) |msg| {
+                    defer self.gpa.free(msg);
+                    self.logTrace(msg, null) catch {};
+                } else |_| {}
+            };
             var w = json.Writer.init(self.gpa);
             defer w.deinit();
             try w.beginObject();
@@ -226,7 +298,8 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "exit")) {
             self.exit_code = if (self.shutting_down) 0 else 1;
         } else if (std.mem.eql(u8, method, "initialized")) {
-            try self.registerWatchers();
+            try self.registerCapabilities();
+            if (self.config.configuration_hook != null and self.client.configuration) try self.requestSettings();
         } else if (std.mem.eql(u8, method, "textDocument/didOpen")) {
             const td = json.get(params, "textDocument") orelse return;
             const u = json.getString(td, "uri") orelse return;
@@ -255,6 +328,8 @@ pub const Server = struct {
             }
         } else if (std.mem.eql(u8, method, "workspace/didChangeConfiguration")) {
             try self.configurationChanged(params);
+        } else if (std.mem.eql(u8, method, "$/setTrace")) {
+            self.setTrace(json.getString(params, "value"));
         } else if (std.mem.eql(u8, method, "$/cancelRequest")) {
             const idv = json.get(params, "id") orelse return;
             const text = try std.json.Stringify.valueAlloc(self.gpa, idv, .{});
@@ -348,6 +423,9 @@ pub const Server = struct {
         self.client.hierarchical_symbols = json.getBool(json.get(td, "documentSymbol"), "hierarchicalDocumentSymbolSupport") orelse false;
         self.client.related_information = json.getBool(json.get(td, "publishDiagnostics"), "relatedInformation") orelse false;
         self.client.watched_files = json.getBool(json.path(caps, &.{ "workspace", "didChangeWatchedFiles" }), "dynamicRegistration") orelse false;
+        self.setTrace(json.getString(params, "trace"));
+        self.client.configuration = json.getBool(json.get(caps, "workspace"), "configuration") orelse false;
+        self.client.configuration_changes = json.getBool(json.path(caps, &.{ "workspace", "didChangeConfiguration" }), "dynamicRegistration") orelse false;
 
         // The workspace: its folders, or the root
         var roots: std.ArrayList([]const u8) = .empty;
@@ -463,9 +541,12 @@ pub const Server = struct {
     }
 
     /// Ask the client to tell us about changes to the language's files on
-    /// disk (dynamic registration of workspace/didChangeWatchedFiles).
-    fn registerWatchers(self: *Server) !void {
-        if (!self.client.watched_files or self.config.extensions.len == 0) return;
+    /// disk (workspace/didChangeWatchedFiles) and, for the `configuration`
+    /// hook, to its settings (workspace/didChangeConfiguration).
+    fn registerCapabilities(self: *Server) !void {
+        const watch = self.client.watched_files and self.config.extensions.len != 0;
+        const settings = self.client.configuration_changes and self.config.configuration_hook != null;
+        if (!watch and !settings) return;
         var w = json.Writer.init(self.gpa);
         defer w.deinit();
         try w.beginObject();
@@ -477,22 +558,34 @@ pub const Server = struct {
         try w.beginObject();
         try w.key("registrations");
         try w.beginArray();
-        try w.beginObject();
-        try w.fieldString("id", "zlsp-watch");
-        try w.fieldString("method", "workspace/didChangeWatchedFiles");
-        try w.key("registerOptions");
-        try w.beginObject();
-        try w.key("watchers");
-        try w.beginArray();
-        for (self.config.extensions) |ext| {
+        if (settings) {
             try w.beginObject();
-            var buf: [128]u8 = undefined;
-            try w.fieldString("globPattern", std.fmt.bufPrint(&buf, "**/*{s}", .{ext}) catch continue);
+            try w.fieldString("id", "zlsp-settings");
+            try w.fieldString("method", "workspace/didChangeConfiguration");
+            try w.key("registerOptions");
+            try w.beginObject();
+            try w.fieldString("section", self.config.section);
+            try w.endObject();
             try w.endObject();
         }
-        try w.endArray();
-        try w.endObject();
-        try w.endObject();
+        if (watch) {
+            try w.beginObject();
+            try w.fieldString("id", "zlsp-watch");
+            try w.fieldString("method", "workspace/didChangeWatchedFiles");
+            try w.key("registerOptions");
+            try w.beginObject();
+            try w.key("watchers");
+            try w.beginArray();
+            for (self.config.extensions) |ext| {
+                try w.beginObject();
+                var buf: [128]u8 = undefined;
+                try w.fieldString("globPattern", std.fmt.bufPrint(&buf, "**/*{s}", .{ext}) catch continue);
+                try w.endObject();
+            }
+            try w.endArray();
+            try w.endObject();
+            try w.endObject();
+        }
         try w.endArray();
         try w.endObject();
         try w.endObject();
@@ -510,18 +603,22 @@ pub const Server = struct {
         return false;
     }
 
-    /// The key zrules knows a new file by: its path under a root without the
-    /// extension (`lib/util`), else its name without it. Unique: if another
-    /// file has it (the same path under two workspace folders), it is
-    /// prefixed with its folder's name (`client/lib/util`), then numbered.
-    fn keyOf(self: *Server, a: Allocator, path_opt: ?[]const u8, uri: []const u8) ![]u8 {
-        const p = path_opt orelse return a.dupe(u8, uri);
+    /// The key zrules knows a new file by (allocated in `a`): its path under
+    /// its workspace folder without the extension (`lib/util`), else its
+    /// name without it. Unique: if another file has it (the same path under
+    /// two workspace folders), it is prefixed with its folder's name
+    /// (`client/lib/util`), then numbered.
+    fn keyOf(self: *Server, a: Allocator, path_opt: ?[]const u8, uri: []const u8) !Project.Key {
+        const p = path_opt orelse {
+            const k = try a.dupe(u8, uri);
+            return .{ .key = k, .rel = k, .folder = "" };
+        };
         var rel: []const u8 = std.fs.path.basename(p);
-        var root_name: []const u8 = "";
+        var folder: []const u8 = "";
         for (self.roots.items) |root| {
             if (isUnder(p, root)) {
-                rel = p[root.len + 1 ..];
-                root_name = std.fs.path.basename(root);
+                rel = std.mem.trimStart(u8, p[root.len..], "/\\");
+                folder = root;
                 break;
             }
         }
@@ -531,28 +628,21 @@ pub const Server = struct {
                 break;
             }
         }
-        var key = try a.dupe(u8, rel);
+        const key = try a.dupe(u8, rel);
         for (key) |*c| {
             if (c.* == '\\') c.* = '/';
         }
-        if (self.project.byKey(key) == null) return key;
-        if (root_name.len != 0) {
-            const prefixed = try std.fmt.allocPrint(a, "{s}/{s}", .{ root_name, key });
-            if (self.project.byKey(prefixed) == null) {
-                a.free(key);
-                return prefixed;
-            }
-            a.free(prefixed);
+        const out = Project.Key{ .key = key, .rel = key, .folder = folder };
+        if (self.project.byKey(key) == null) return out;
+        const folder_name = std.fs.path.basename(std.mem.trimEnd(u8, folder, "/\\"));
+        if (folder_name.len != 0) {
+            const prefixed = try std.fmt.allocPrint(a, "{s}/{s}", .{ folder_name, key });
+            if (self.project.byKey(prefixed) == null) return .{ .key = prefixed, .rel = key, .folder = folder };
         }
         var n: usize = 2;
         while (true) : (n += 1) {
             const numbered = try std.fmt.allocPrint(a, "{s}#{d}", .{ key, n });
-            if (self.project.byKey(numbered) == null) {
-                a.free(key);
-                key = numbered;
-                return key;
-            }
-            a.free(numbered);
+            if (self.project.byKey(numbered) == null) return .{ .key = numbered, .rel = key, .folder = folder };
         }
     }
 
@@ -578,12 +668,44 @@ pub const Server = struct {
         for (gone.items) |u| try self.forget(u);
     }
 
-    /// workspace/didChangeConfiguration: the settings go to the
-    /// `configuration` hook (which may change what the rules check: the
-    /// whole project is checked again).
+    /// workspace/didChangeConfiguration. A client that answers
+    /// workspace/configuration is asked for the settings (it may send none
+    /// here); else they are these: the section's, if they have it.
     fn configurationChanged(self: *Server, params: ?Value) !void {
-        const hook = self.config.configuration_hook orelse return;
+        if (self.config.configuration_hook == null) return;
+        if (self.client.configuration) return self.requestSettings();
         const settings = json.get(params, "settings") orelse return;
+        if (settings == .null) return;
+        try self.applySettings(json.get(settings, self.config.section) orelse settings);
+    }
+
+    /// Ask the client for the settings of the section.
+    fn requestSettings(self: *Server) !void {
+        var w = json.Writer.init(self.gpa);
+        defer w.deinit();
+        try w.beginObject();
+        try w.fieldString("jsonrpc", "2.0");
+        try w.fieldInt("id", self.next_request_id);
+        self.settings_request = self.next_request_id;
+        self.next_request_id += 1;
+        try w.fieldString("method", "workspace/configuration");
+        try w.key("params");
+        try w.beginObject();
+        try w.key("items");
+        try w.beginArray();
+        try w.beginObject();
+        try w.fieldString("section", self.config.section);
+        try w.endObject();
+        try w.endArray();
+        try w.endObject();
+        try w.endObject();
+        try self.send(&w);
+    }
+
+    /// The settings go to the `configuration` hook (null: None), and the
+    /// project is checked again (the hook may change what the rules do).
+    fn applySettings(self: *Server, settings: Value) !void {
+        const hook = self.config.configuration_hook orelse return;
         const text = try std.json.Stringify.valueAlloc(self.gpa, settings, .{});
         defer self.gpa.free(text);
         const result = try self.callHook("configuration", hook, &.{jsonToPython(text)});
@@ -677,9 +799,9 @@ pub const Server = struct {
     fn addDiskFile(self: *Server, path: []const u8, text: []const u8) !void {
         const u = try uri_mod.fromPath(self.gpa, path);
         defer self.gpa.free(u);
-        const key = try self.keyOf(self.gpa, path, u);
-        defer self.gpa.free(key);
-        _ = try self.project.add(u, path, key, text);
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        _ = try self.project.add(u, path, try self.keyOf(arena.allocator(), path, u), text);
     }
 
     fn openFile(self: *Server, uri: []const u8, text: []const u8, version: i64) !void {
@@ -702,9 +824,9 @@ pub const Server = struct {
         }
         const p = try uri_mod.toPath(self.gpa, uri);
         defer if (p) |x| self.gpa.free(x);
-        const key = try self.keyOf(self.gpa, p, uri);
-        defer self.gpa.free(key);
-        const f = try self.project.add(uri, p, key, text);
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const f = try self.project.add(uri, p, try self.keyOf(arena.allocator(), p, uri), text);
         f.doc.version = version;
         f.open = true;
     }

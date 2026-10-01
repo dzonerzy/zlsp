@@ -35,6 +35,7 @@ write("main.tiny", table.concat({
   "",
 }, "\n"))
 write("broken.tiny", "let y = ;\nprint(y);\n")
+write("messy.tiny", "fn f(a) {\nreturn a;   \n}\nprint(f(1));\n")
 
 local failures = 0
 local function check(name, cond, detail)
@@ -120,6 +121,19 @@ check("references", table.concat(lines, ",") == "1,3,3,9", lines)
 local hover = request("textDocument/hover", at(9, 21))
 check("hover", hover and hover.contents.value:find("function fib") ~= nil, hover)
 check("hover: the doc comment", hover and hover.contents.value:find("A program with mistakes") ~= nil, hover)
+local print_hover = request("textDocument/hover", at(12, 2))
+check("hover: the hook's docs", print_hover and print_hover.contents.value:find("Writes its arguments") ~= nil, print_hover)
+
+local remove = request("textDocument/codeAction", {
+  textDocument = { uri = uri },
+  range = { start = { line = 13, character = 0 }, ["end"] = { line = 13, character = 5 } },
+  context = { diagnostics = {} },
+})
+local titles = {}
+for _, a in ipairs(remove or {}) do
+  table.insert(titles, a.title)
+end
+check("a code action from the hook", vim.tbl_contains(titles, "Remove the 'break'"), titles)
 
 local symbols = request("textDocument/documentSymbol", { textDocument = { uri = uri } })
 local names = {}
@@ -173,6 +187,30 @@ check("rename", vim.api.nvim_buf_get_lines(buf, 7, 8, false)[1] == "let k = 0;"
 vim.api.nvim_buf_set_lines(buf, 12, 12, false, { "let missing = 1;" })
 check("diagnostics after an edit", vim.wait(10000, function()
   return diag_codes(buf) == "14:break-outside-loop"
+end), diag_codes(buf))
+
+-- Formatting, by the hook
+vim.cmd.edit(ws .. "/messy.tiny")
+local messy = vim.api.nvim_get_current_buf()
+vim.wait(10000, function()
+  return #vim.lsp.get_clients({ bufnr = messy }) > 0
+end)
+vim.lsp.buf.format({ bufnr = messy, timeout_ms = 10000 })
+check("formatting", table.concat(vim.api.nvim_buf_get_lines(messy, 0, -1, false), "\n") == "fn f(a) {\n    return a;\n}\nprint(f(1));",
+  vim.api.nvim_buf_get_lines(messy, 0, -1, false))
+vim.cmd.buffer(buf)
+
+-- A setting: Neovim answers the server's workspace/configuration from
+-- `settings`; a change is announced, the server asks again
+client.settings = { tiny = { maxLineLength = 30 } }
+client:notify("workspace/didChangeConfiguration", { settings = client.settings })
+check("a setting", vim.wait(10000, function()
+  return diag_codes(buf):find("3:line%-too%-long") ~= nil
+end), diag_codes(buf))
+client.settings = { tiny = { maxLineLength = 0 } }
+client:notify("workspace/didChangeConfiguration", { settings = client.settings })
+check("a setting, changed back", vim.wait(10000, function()
+  return diag_codes(buf):find("line%-too%-long") == nil
 end), diag_codes(buf))
 
 -- A quick fix

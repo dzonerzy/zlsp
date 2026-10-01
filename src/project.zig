@@ -52,6 +52,8 @@ pub const Config = struct {
     code_action_hook: ?*PyObject = null,
     format_hook: ?*PyObject = null,
     configuration_hook: ?*PyObject = null,
+    /// The settings section the hook gets (`tiny` for `tiny.*`): the name
+    section: []const u8 = "zlsp",
 };
 
 /// A zrules Selector's native match function (its capsule, kept alive by
@@ -141,9 +143,14 @@ pub const File = struct {
     /// Its canonical URI (uri.canonical), what the project knows it by
     id: []u8,
     path: ?[]u8,
-    /// The name other files import it by (its path under the root, without
-    /// the extension), the key zrules knows it by
+    /// The key zrules knows it by: its path under its workspace folder,
+    /// without the extension (`lib/util`), the name other files import it
+    /// by; prefixed with the folder's name if another folder has the same
+    /// path (`server/lib/util`)
     key: []u8,
+    /// That path, unprefixed, and the folder (empty: none)
+    rel: []u8,
+    folder: []u8,
     doc: document.Document,
     /// Opened in the editor (its text is the buffer's, not the disk's)
     open: bool = false,
@@ -152,6 +159,8 @@ pub const File = struct {
     /// The text_gen the tree was parsed from, and the analysis checked
     parsed_gen: u64 = 0,
     checked_gen: u64 = 0,
+    /// The project generation it was last checked at
+    checked_at: u64 = 0,
     tree: ?*PyObject = null,
     analysis: ?*Analysis = null,
     /// The diagnostics last published (JSON), to publish only changes
@@ -170,6 +179,8 @@ pub const File = struct {
         gpa.free(self.id);
         if (self.path) |p| gpa.free(p);
         gpa.free(self.key);
+        gpa.free(self.rel);
+        gpa.free(self.folder);
         gpa.destroy(self);
     }
 };
@@ -188,11 +199,53 @@ pub const Project = struct {
     /// The last analysis failure (a Python exception in a custom rule),
     /// logged once per distinct message
     last_failure: ?[]u8 = null,
+    /// How many files the last analysis checked
+    last_checked: usize = 0,
+    /// The files by key (their index in `files`), and by unprefixed path;
+    /// of the structure_gen they were made for
+    by_key: std.StringHashMapUnmanaged(usize) = .empty,
+    by_rel: std.StringHashMapUnmanaged(std.ArrayList(*File)) = .empty,
+    index_gen: u64 = 0,
+    /// The resolve function given to zrules (made once): the configured
+    /// one, then the importing file's own folder first
+    resolver: ?*PyObject = null,
 
     pub fn deinit(self: *Project) void {
+        if (self.resolver) |r| py.Py_DecRef(r);
+        self.clearIndex();
+        self.by_key.deinit(self.gpa);
+        self.by_rel.deinit(self.gpa);
         for (self.files.values()) |f| f.destroy(self.gpa);
         self.files.deinit(self.gpa);
         if (self.last_failure) |m| self.gpa.free(m);
+    }
+
+    fn clearIndex(self: *Project) void {
+        self.by_key.clearRetainingCapacity();
+        var it = self.by_rel.valueIterator();
+        while (it.next()) |list| list.deinit(self.gpa);
+        self.by_rel.clearRetainingCapacity();
+    }
+
+    /// Bring by_key and by_rel up to date.
+    fn index(self: *Project) !void {
+        if (self.index_gen == self.structure_gen) return;
+        self.clearIndex();
+        for (self.files.values(), 0..) |f, i| {
+            try self.by_key.put(self.gpa, f.key, i);
+            const entry = try self.by_rel.getOrPut(self.gpa, f.rel);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(self.gpa, f);
+        }
+        self.index_gen = self.structure_gen;
+    }
+
+    /// Whether two files have the same path (in two folders).
+    fn hasCollisions(self: *Project) bool {
+        for (self.files.values()) |f| {
+            if (f.key.len != f.rel.len) return true;
+        }
+        return false;
     }
 
     /// The file a URI names, however the client spells it.
@@ -203,7 +256,9 @@ pub const Project = struct {
     }
 
     /// Add a file (or return it if known) with `text`.
-    pub fn add(self: *Project, uri: []const u8, path: ?[]const u8, key: []const u8, text: []const u8) !*File {
+    pub const Key = struct { key: []const u8, rel: []const u8, folder: []const u8 };
+
+    pub fn add(self: *Project, uri: []const u8, path: ?[]const u8, key: Key, text: []const u8) !*File {
         if (self.get(uri)) |f| return f;
         const f = try self.gpa.create(File);
         errdefer self.gpa.destroy(f);
@@ -211,7 +266,9 @@ pub const Project = struct {
             .uri = try self.gpa.dupe(u8, uri),
             .id = try uri_mod.canonical(self.gpa, uri),
             .path = if (path) |p| try self.gpa.dupe(u8, p) else null,
-            .key = try self.gpa.dupe(u8, key),
+            .key = try self.gpa.dupe(u8, key.key),
+            .rel = try self.gpa.dupe(u8, key.rel),
+            .folder = try self.gpa.dupe(u8, key.folder),
             .doc = try document.Document.init(self.gpa, text, 0),
         };
         try self.files.put(self.gpa, f.id, f);
@@ -244,10 +301,8 @@ pub const Project = struct {
 
     /// The file with a zrules key, if any.
     pub fn byKey(self: *Project, key: []const u8) ?*File {
-        for (self.files.values()) |f| {
-            if (std.mem.eql(u8, f.key, key)) return f;
-        }
-        return null;
+        const i = self.indexOfKey(key) orelse return null;
+        return self.files.values()[i];
     }
 
     pub const Outcome = enum { unchanged, analyzed, failed, interrupted };
@@ -331,7 +386,11 @@ pub const Project = struct {
                 try self.extractAll(needed, project_obj, failure, failure_len);
                 if (full or round >= 8 or !self.addImported(needed)) break;
             }
-        } else try self.extractAll(in_set, null, failure, failure_len);
+            self.last_checked = std.mem.count(bool, needed, &.{true});
+        } else {
+            try self.extractAll(in_set, null, failure, failure_len);
+            self.last_checked = std.mem.count(bool, in_set, &.{true});
+        }
 
         for (files) |f| f.checked_gen = f.text_gen;
         self.checked_structure = self.structure_gen;
@@ -340,10 +399,75 @@ pub const Project = struct {
     }
 
     fn indexOfKey(self: *Project, key: []const u8) ?usize {
-        for (self.files.values(), 0..) |f, i| {
-            if (std.mem.eql(u8, f.key, key)) return i;
+        self.index() catch {
+            // (out of memory: the slow way)
+            for (self.files.values(), 0..) |f, i| {
+                if (std.mem.eql(u8, f.key, key)) return i;
+            }
+            return null;
+        };
+        return self.by_key.get(key);
+    }
+
+    /// The key a module the file `importer` imports stands for: the
+    /// configured resolve's answer (else the module's text, unquoted, as
+    /// zrules does), and of the files with that path, the one in the
+    /// importer's own folder. Null: nothing (the import is unresolved).
+    fn resolveImport(self: *Project, module: *PyObject, importer: *PyObject) ?*PyObject {
+        const key_obj: *PyObject = if (self.config.resolve) |r|
+            py.c.PyObject_CallFunctionObjArgs(r, module, importer, @as(?*PyObject, null)) orelse return null
+        else blk: {
+            const text = ph.utf8(module, "module") orelse return null;
+            const unquoted = if (text.len >= 2 and (text[0] == '"' or text[0] == '\'') and text[text.len - 1] == text[0]) text[1 .. text.len - 1] else text;
+            break :blk ph.newString(unquoted) orelse return null;
+        };
+        if (key_obj == py.Py_None()) return key_obj;
+        const key = ph.utf8(key_obj, "the resolved key") orelse {
+            py.Py_DecRef(key_obj);
+            return null;
+        };
+        const importer_key = ph.utf8(importer, "importing key") orelse {
+            py.Py_DecRef(key_obj);
+            return null;
+        };
+        self.index() catch return key_obj;
+        const from = self.byKey(importer_key) orelse return key_obj;
+        const same_path = self.by_rel.get(key) orelse return key_obj;
+        for (same_path.items) |f| {
+            if (!std.mem.eql(u8, f.folder, from.folder)) continue;
+            py.Py_DecRef(key_obj);
+            return ph.newString(f.key);
         }
-        return null;
+        return key_obj;
+    }
+
+    var resolver_def = py.c.PyMethodDef{
+        .ml_name = "zlsp_resolve",
+        .ml_meth = @ptrCast(&resolverCall),
+        .ml_flags = py.c.METH_VARARGS,
+        .ml_doc = null,
+    };
+
+    fn resolverCall(self_obj: ?*PyObject, args: ?*PyObject) callconv(.c) ?*PyObject {
+        const ptr = py.c.PyCapsule_GetPointer(self_obj, "zlsp.project") orelse return null;
+        const self: *Project = @ptrCast(@alignCast(ptr));
+        if (py.c.PyTuple_Size(args) != 2) {
+            ph.raise(py.PyExc_TypeError(), "resolve(module, importing_key)", .{});
+            return null;
+        }
+        return self.resolveImport(py.c.PyTuple_GetItem(args, 0).?, py.c.PyTuple_GetItem(args, 1).?);
+    }
+
+    /// The resolve function for zrules: with files of the same path in two
+    /// folders, ours (which picks the importer's); else the configured one.
+    fn resolveFn(self: *Project) ?*PyObject {
+        if (!self.hasCollisions()) return self.config.resolve;
+        if (self.resolver == null) {
+            const capsule = py.c.PyCapsule_New(self, "zlsp.project", null) orelse return null;
+            defer py.Py_DecRef(capsule);
+            self.resolver = py.c.PyCFunction_NewEx(&resolver_def, capsule, null);
+        }
+        return self.resolver;
     }
 
     /// Add to `set` the files its files import, until nothing more is
@@ -391,6 +515,7 @@ pub const Project = struct {
             };
             if (f.analysis) |old| old.destroy(self.gpa);
             f.analysis = a;
+            f.checked_at = self.generation;
         }
     }
 
@@ -412,9 +537,9 @@ pub const Project = struct {
         defer py.Py_DecRef(args);
         const kwargs = py.c.PyDict_New() orelse return null;
         defer py.Py_DecRef(kwargs);
-        if (self.config.resolve) |r| {
+        if (self.resolveFn()) |r| {
             if (py.c.PyDict_SetItemString(kwargs, "resolve", r) != 0) return null;
-        }
+        } else if (py.c.PyErr_Occurred() != null) return null;
         return py.c.PyObject_Call(method, args, kwargs);
     }
 
