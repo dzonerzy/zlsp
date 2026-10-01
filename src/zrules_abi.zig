@@ -1,5 +1,5 @@
 //! zrules' results as native code reads them, through two capsules:
-//! `Analysis.capsule` ("zrules.analysis.v1": the symbol table) and
+//! `Analysis.capsule` ("zrules.analysis.v2": the symbol table) and
 //! `Selector.capsule` ("zrules.selector.v1": a match function over zgram's
 //! tree capsule). zrules' src/native_abi.zig is the definition; this is the
 //! consumer's copy. Everything a capsule points to stays valid while the
@@ -8,9 +8,11 @@
 const std = @import("std");
 const tree_mod = @import("tree.zig");
 
-/// Version of both interfaces below, bumped on any incompatible change.
-pub const NATIVE_ABI: u32 = 1;
-pub const ANALYSIS_CAPSULE = "zrules.analysis.v1";
+/// Versions of the two interfaces below, each bumped on any incompatible
+/// change (and named in its capsule's name)
+pub const ANALYSIS_ABI: u32 = 2;
+pub const SELECTOR_ABI: u32 = 1;
+pub const ANALYSIS_CAPSULE = "zrules.analysis.v2";
 pub const SELECTOR_CAPSULE = "zrules.selector.v1";
 
 /// "None": a builtin's node, a global scope, no owned scope, ...
@@ -52,12 +54,16 @@ pub const SymbolView = extern struct {
 /// What `Analysis.capsule` points to: every symbol, in the order the rules
 /// found them (Analysis.symbols' order)
 pub const AnalysisView = extern struct {
-    abi: u32 = NATIVE_ABI,
+    abi: u32 = ANALYSIS_ABI,
     symbol_count: u32 = 0,
     symbols: ?[*]const SymbolView = null,
     /// Spans and nodes of the uses, grouped by symbol
     uses: ?[*]const Span = null,
     use_nodes: ?[*]const u32 = null,
+    /// In a project: the keys this file's imports ask for, each once, found
+    /// or not (what an editor checks it with, and re-checks it after)
+    import_count: u32 = 0,
+    imports: ?[*]const Str = null,
 };
 
 /// Writes the indices of the nodes of `tree` that match into `out` (room
@@ -67,7 +73,7 @@ pub const MatchFn = *const fn (ctx: *const anyopaque, tree: *const tree_mod.Tree
 
 /// What `Selector.capsule` points to
 pub const SelectorView = extern struct {
-    abi: u32 = NATIVE_ABI,
+    abi: u32 = SELECTOR_ABI,
     ctx: *const anyopaque,
     match: MatchFn,
 };

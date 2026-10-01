@@ -50,6 +50,8 @@ pub const Server = struct {
     /// Keywords, for lookups
     keywords: std.StringHashMapUnmanaged(void) = .empty,
     next_request_id: i64 = 1,
+    /// Set by the transport: is input waiting? (stops an idle analysis)
+    interrupt: ?project_mod.Project.Interrupt = null,
     client: struct {
         multiline_tokens: bool = false,
         hierarchical_symbols: bool = false,
@@ -119,26 +121,34 @@ pub const Server = struct {
         }
     }
 
-    /// Nothing more to read for now: analyze and publish.
+    /// Nothing more to read for now: analyze and publish. The analysis stops
+    /// between files if `interrupt` says input arrived (it goes on at the
+    /// next idle, after that input).
     pub fn idle(self: *Server) !void {
         if (!self.initialized) return;
-        try self.analyze();
+        if (try self.analyzeWith(self.interrupt) == .interrupted) return;
         try self.publishAll();
     }
 
+    /// Bring the analysis up to date, completely (a request needs it).
     fn analyze(self: *Server) !void {
+        _ = try self.analyzeWith(null);
+    }
+
+    fn analyzeWith(self: *Server, interrupt: ?project_mod.Project.Interrupt) !project_mod.Project.Outcome {
         var buf: [512]u8 = undefined;
         var len: usize = 0;
-        const outcome = try self.project.analyze(&buf, &len);
-        if (outcome != .failed) return;
+        const outcome = try self.project.analyze(&buf, &len, interrupt);
+        if (outcome != .failed) return outcome;
         const text = buf[0..len];
         if (self.project.last_failure) |prev| {
-            if (std.mem.eql(u8, prev, text)) return;
+            if (std.mem.eql(u8, prev, text)) return outcome;
             self.gpa.free(prev);
         }
         self.project.last_failure = try self.gpa.dupe(u8, text);
         var msg: [600]u8 = undefined;
         try self.logMessage(1, std.fmt.bufPrint(&msg, "analysis failed: {s}", .{text}) catch text);
+        return outcome;
     }
 
     fn request(self: *Server, a: Allocator, id: []const u8, method: []const u8, params: ?Value) !void {

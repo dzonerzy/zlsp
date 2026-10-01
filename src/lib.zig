@@ -333,8 +333,8 @@ fn compileSelector(state: *State, cls: *PyObject, text: *PyObject) error{ Python
     errdefer py.Py_DecRef(capsule);
     const raw = py.c.PyCapsule_GetPointer(capsule, zabi.SELECTOR_CAPSULE) orelse return error.Python;
     const view: project_mod.Selector = @ptrCast(@alignCast(raw));
-    if (view.abi != zabi.NATIVE_ABI) {
-        raise(py.PyExc_ImportError(), "zlsp reads zrules selectors with ABI {d}, but this zrules has {d}: upgrade zlsp or zrules", .{ zabi.NATIVE_ABI, view.abi });
+    if (view.abi != zabi.SELECTOR_ABI) {
+        raise(py.PyExc_ImportError(), "zlsp reads zrules selectors with ABI {d}, but this zrules has {d}: upgrade zlsp or zrules", .{ zabi.SELECTOR_ABI, view.abi });
         return error.Python;
     }
     try state.refs.append(allocator, capsule);
@@ -403,6 +403,13 @@ const Inbox = struct {
     slots: [256][]u8 = undefined,
     queue: Queue = undefined,
     refs: std.atomic.Value(u32) = .init(2),
+    /// Messages put and not yet taken (the queue can't be peeked)
+    waiting: std.atomic.Value(u32) = .init(0),
+
+    fn pending(ctx: *anyopaque) bool {
+        const self: *Inbox = @ptrCast(@alignCast(ctx));
+        return self.waiting.load(.acquire) > 0;
+    }
 
     fn create() !*Inbox {
         const inbox = try allocator.create(Inbox);
@@ -435,6 +442,7 @@ fn readInput(io: std.Io, inbox: *Inbox) void {
         if (n == 0) return;
         framer.feed(buf[0..n]) catch return;
         while (framer.next() catch return) |msg| {
+            _ = inbox.waiting.fetchAdd(1, .acq_rel);
             inbox.queue.putOne(io, msg) catch {
                 allocator.free(msg);
                 return;
@@ -460,6 +468,9 @@ fn serve(state: *State) !i64 {
     defer inbox.release(io);
     const queue = &inbox.queue;
     const stdout = std.Io.File.stdout();
+    // An idle analysis stops when input arrives
+    srv.interrupt = .{ .ctx = inbox, .pending = &Inbox.pending };
+    defer srv.interrupt = null;
 
     var batch: [256][]u8 = undefined;
     while (srv.exit_code == null) {
@@ -473,6 +484,7 @@ fn serve(state: *State) !i64 {
             batch[0] = msg;
             n = 1;
         }
+        _ = inbox.waiting.fetchSub(@intCast(n), .acq_rel);
         // Cancellations first: they may be about requests in the batch
         for (batch[0..n]) |msg| {
             if (std.mem.indexOf(u8, msg, "\"$/cancelRequest\"") != null) try srv.handle(msg);

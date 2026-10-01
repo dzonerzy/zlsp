@@ -99,6 +99,8 @@ pub const Analysis = struct {
     token_nodes: []const []const u32 = &.{},
     /// Nodes matched by the fold rules (null: none configured)
     fold_nodes: ?[]const u32 = null,
+    /// The keys of the files it imports (resolved), from the check
+    imports: []const []const u8 = &.{},
 
     pub fn destroy(self: *Analysis, gpa: Allocator) void {
         if (self.checked) |c| py.Py_DecRef(c);
@@ -138,8 +140,9 @@ pub const File = struct {
     open: bool = false,
     /// Bumped on each change of the text
     text_gen: u64 = 1,
-    /// The text_gen the tree was parsed from
+    /// The text_gen the tree was parsed from, and the analysis checked
     parsed_gen: u64 = 0,
+    checked_gen: u64 = 0,
     tree: ?*PyObject = null,
     analysis: ?*Analysis = null,
     /// The diagnostics last published (JSON), to publish only changes
@@ -165,6 +168,10 @@ pub const Project = struct {
     /// Bumped on any change; `analyzed` is the generation last analyzed
     generation: u64 = 1,
     analyzed: u64 = 0,
+    /// Bumped when files come or go (the whole project is checked again);
+    /// the value at the last check
+    structure_gen: u64 = 1,
+    checked_structure: u64 = 0,
     /// The last analysis failure (a Python exception in a custom rule),
     /// logged once per distinct message
     last_failure: ?[]u8 = null,
@@ -196,6 +203,7 @@ pub const Project = struct {
         };
         try self.files.put(self.gpa, f.id, f);
         self.generation += 1;
+        self.structure_gen += 1;
         return f;
     }
 
@@ -212,6 +220,7 @@ pub const Project = struct {
         _ = self.files.orderedRemove(f.id);
         f.destroy(self.gpa);
         self.generation += 1;
+        self.structure_gen += 1;
     }
 
     /// The text of `f` changed.
@@ -228,16 +237,32 @@ pub const Project = struct {
         return null;
     }
 
-    pub const Outcome = enum { unchanged, analyzed, failed };
+    pub const Outcome = enum { unchanged, analyzed, failed, interrupted };
 
-    /// Bring every file's analysis up to date: parse what changed, check
-    /// the whole project. On a Python failure (a custom rule raising), the
-    /// files keep only their syntax errors and `failure` gets the message.
-    pub fn analyze(self: *Project, failure: *[512]u8, failure_len: *usize) !Outcome {
+    /// Asked between files while parsing: is new input waiting? (The
+    /// analysis then stops; what it parsed is kept, the rest is done on the
+    /// next call.)
+    pub const Interrupt = struct {
+        ctx: *anyopaque,
+        pending: *const fn (ctx: *anyopaque) bool,
+    };
+
+    /// Bring every file's analysis up to date: parse what changed, and check
+    /// what an edit can have changed: the edited files, the files that
+    /// import them (directly or not), with the files those import. The rest
+    /// keep their analyses. The whole project is checked on the first call,
+    /// and when files come or go. On a Python failure (a custom rule
+    /// raising), the files keep only their syntax errors and `failure` gets
+    /// the message.
+    pub fn analyze(self: *Project, failure: *[512]u8, failure_len: *usize, interrupt: ?Interrupt) !Outcome {
         if (self.analyzed == self.generation) return .unchanged;
         failure_len.* = 0;
-        for (self.files.values()) |f| {
+        const files = self.files.values();
+        for (files) |f| {
             if (f.parsed_gen == f.text_gen and f.tree != null) continue;
+            if (interrupt) |i| {
+                if (i.pending(i.ctx)) return .interrupted;
+            }
             const tree = parseText(self.config.parser, f.doc.text.items) orelse {
                 failure_len.* = ph.takeError(failure).len;
                 continue;
@@ -247,15 +272,95 @@ pub const Project = struct {
             f.parsed_gen = f.text_gen;
         }
 
-        // Check everything together (imports), or each tree on its own
-        var project_obj: ?*PyObject = null;
-        defer if (project_obj) |p| py.Py_DecRef(p);
-        if (self.config.rules) |rules| {
-            project_obj = self.check(rules);
-            if (project_obj == null) failure_len.* = ph.takeError(failure).len;
+        // What to check
+        const in_set = try self.gpa.alloc(bool, files.len);
+        defer self.gpa.free(in_set);
+        @memset(in_set, false);
+        var full = self.checked_structure != self.structure_gen;
+        for (files, in_set) |f, *slot| {
+            if (f.analysis == null) full = true;
+            slot.* = f.checked_gen != f.text_gen;
+        }
+        if (full) @memset(in_set, true) else if (self.config.rules != null) {
+            // The files importing an edited one, and theirs...
+            var grew = true;
+            while (grew) {
+                grew = false;
+                for (files, in_set) |f, *slot| {
+                    if (slot.*) continue;
+                    for (f.analysis.?.imports) |key| {
+                        const i = self.indexOfKey(key) orelse continue;
+                        if (!in_set[i]) continue;
+                        slot.* = true;
+                        grew = true;
+                        break;
+                    }
+                }
+            }
         }
 
-        for (self.files.values()) |f| {
+        if (self.config.rules) |rules| {
+            // ... checked with the files they import (to resolve them)
+            const needed = try self.gpa.alloc(bool, files.len);
+            defer self.gpa.free(needed);
+            @memcpy(needed, in_set);
+            if (!full) _ = self.addImported(needed);
+            // A file's new imports are known once it is checked: if they
+            // reach outside the set, check again with them
+            var round: usize = 0;
+            while (true) : (round += 1) {
+                const project_obj = self.check(rules, needed) orelse {
+                    failure_len.* = ph.takeError(failure).len;
+                    try self.extractAll(needed, null, failure, failure_len);
+                    break;
+                };
+                defer py.Py_DecRef(project_obj);
+                try self.extractAll(needed, project_obj, failure, failure_len);
+                if (full or round >= 8 or !self.addImported(needed)) break;
+            }
+        } else try self.extractAll(in_set, null, failure, failure_len);
+
+        for (files) |f| f.checked_gen = f.text_gen;
+        self.checked_structure = self.structure_gen;
+        self.analyzed = self.generation;
+        return if (failure_len.* != 0) .failed else .analyzed;
+    }
+
+    fn indexOfKey(self: *Project, key: []const u8) ?usize {
+        for (self.files.values(), 0..) |f, i| {
+            if (std.mem.eql(u8, f.key, key)) return i;
+        }
+        return null;
+    }
+
+    /// Add to `set` the files its files import, until nothing more is
+    /// reachable; whether anything was added.
+    fn addImported(self: *Project, set: []bool) bool {
+        const files = self.files.values();
+        var added = false;
+        var grew = true;
+        while (grew) {
+            grew = false;
+            for (files, 0..) |f, i| {
+                if (!set[i]) continue;
+                const a = f.analysis orelse continue;
+                for (a.imports) |key| {
+                    const j = self.indexOfKey(key) orelse continue;
+                    if (set[j]) continue;
+                    set[j] = true;
+                    grew = true;
+                    added = true;
+                }
+            }
+        }
+        return added;
+    }
+
+    /// New analyses for the files of `set`, from the project's check (or
+    /// their syntax errors only, with `project_obj` null).
+    fn extractAll(self: *Project, set: []const bool, project_obj: ?*PyObject, failure: *[512]u8, failure_len: *usize) !void {
+        for (self.files.values(), set) |f, wanted| {
+            if (!wanted) continue;
             const tree = f.tree orelse continue;
             var checked: ?*PyObject = null;
             if (project_obj) |p| {
@@ -274,16 +379,15 @@ pub const Project = struct {
             if (f.analysis) |old| old.destroy(self.gpa);
             f.analysis = a;
         }
-        self.analyzed = self.generation;
-        return if (failure_len.* != 0) .failed else .analyzed;
     }
 
-    /// rules.analyze_project({key: tree}, resolve=...) (a new reference), or
-    /// null with the Python error set.
-    fn check(self: *Project, rules: *PyObject) ?*PyObject {
+    /// rules.analyze_project({key: tree} for the files of `set`, resolve=...)
+    /// (a new reference), or null with the Python error set.
+    fn check(self: *Project, rules: *PyObject, set: []const bool) ?*PyObject {
         const files = py.c.PyDict_New() orelse return null;
         defer py.Py_DecRef(files);
-        for (self.files.values()) |f| {
+        for (self.files.values(), set) |f, wanted| {
+            if (!wanted) continue;
             const tree = f.tree orelse continue;
             const key = ph.newString(f.key) orelse return null;
             defer py.Py_DecRef(key);
@@ -354,7 +458,11 @@ pub const Project = struct {
             a.fold_nodes = folds.items;
         }
 
-        if (a.checked) |c| a.syms = try readSymbols(arena, c, &kinds);
+        if (a.checked) |c| {
+            const read = try readChecked(arena, c, &kinds);
+            a.syms = read.syms;
+            a.imports = read.imports;
+        }
         return a;
     }
 };
@@ -376,17 +484,24 @@ fn strOf(s: zabi.Str) ?[]const u8 {
     return p[0..s.len];
 }
 
-/// The symbols of a zrules Analysis, read through its capsule. They point
-/// into the Analysis, which the file's analysis keeps.
-fn readSymbols(arena: Allocator, checked: *PyObject, kinds: *const std.AutoHashMapUnmanaged(u32, lsp.Kind)) error{ Python, OutOfMemory }![]const Sym {
+/// The symbols of a zrules Analysis, and the keys of the files it imports,
+/// read through its capsule. They point into the Analysis, which the file's
+/// analysis keeps.
+fn readChecked(arena: Allocator, checked: *PyObject, kinds: *const std.AutoHashMapUnmanaged(u32, lsp.Kind)) error{ Python, OutOfMemory }!struct { syms: []const Sym, imports: []const []const u8 } {
     const capsule = ph.attr(checked, "capsule") orelse return error.Python;
     defer py.Py_DecRef(capsule);
-    const raw = py.c.PyCapsule_GetPointer(capsule, zabi.ANALYSIS_CAPSULE) orelse return error.Python;
+    const raw = py.c.PyCapsule_GetPointer(capsule, zabi.ANALYSIS_CAPSULE) orelse {
+        py.c.PyErr_Clear();
+        ph.raise(py.PyExc_RuntimeError(), "zlsp needs zrules 0.1.5 or later (the {s} capsule)", .{zabi.ANALYSIS_CAPSULE});
+        return error.Python;
+    };
     const view: *const zabi.AnalysisView = @ptrCast(@alignCast(raw));
-    if (view.abi != zabi.NATIVE_ABI) {
-        ph.raise(py.PyExc_RuntimeError(), "zlsp reads zrules analyses with ABI {d}, but this zrules has {d}: upgrade zlsp or zrules", .{ zabi.NATIVE_ABI, view.abi });
+    if (view.abi != zabi.ANALYSIS_ABI) {
+        ph.raise(py.PyExc_RuntimeError(), "zlsp reads zrules analyses with ABI {d}, but this zrules has {d}: upgrade zlsp or zrules", .{ zabi.ANALYSIS_ABI, view.abi });
         return error.Python;
     }
+    const imports = try arena.alloc([]const u8, view.import_count);
+    for (imports, 0..) |*slot, i| slot.* = strOf(view.imports.?[i]) orelse "";
     const n = view.symbol_count;
     const out = try arena.alloc(Sym, n);
     const all_uses: [*]const Span = @ptrCast(view.uses orelse @as([*]const zabi.Span, &.{}));
@@ -406,7 +521,7 @@ fn readSymbols(arena: Allocator, checked: *PyObject, kinds: *const std.AutoHashM
             .origin_node = v.origin_node,
         };
     }
-    return out;
+    return .{ .syms = out, .imports = imports };
 }
 
 /// parser.parse_tree(bytes, recover=True): a new reference, or null with the
