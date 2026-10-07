@@ -5,7 +5,7 @@ build-backend = "pyoz.backend"
 [project]
 # zsuite packages are named <name>-py on PyPI; the import name stays `zlsp` (module-name below)
 name = "zlsp-py"
-version = "0.1.0"
+version = "0.1.1"
 description = "A native Language Server Protocol server for any language defined with zgram and checked with zrules: diagnostics, navigation, rename, highlighting, completion."
 requires-python = ">=3.10"
 readme = "README.md"
