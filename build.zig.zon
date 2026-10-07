@@ -1,12 +1,12 @@
 .{
     .name = .zlsp,
-    .version = "0.1.1",
+    .version = "0.1.2",
     .fingerprint = 0x301cf6a93c7d35f9,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .PyOZ = .{
-            .url = "https://github.com/pyozig/PyOZ/archive/refs/tags/v0.13.9.tar.gz",
-            .hash = "PyOZ-0.13.9-ntlpPv9CFQCcoHQO42xtnvRWM4OphBbj4oABUJLH3ONC",
+            .url = "https://github.com/pyozig/PyOZ/archive/refs/tags/v0.13.10.tar.gz",
+            .hash = "PyOZ-0.13.10-ntlpPsNdFQAO2gFZziavbQ3_O_J16ON3VeMTaKX4hcUk",
         },
     },
     .paths = .{
