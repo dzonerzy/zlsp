@@ -161,7 +161,7 @@ Selectors are zrules selectors. Names defined without a configured kind show as 
 
 ## Hooks
 
-Python functions that add to what the server does. Each gets the file's URI, its text, and the zrules `Analysis` of the file (None without rules) to look things up in (`analysis.symbol_at(offset)`, `analysis.visible(offset)`, `analysis.type_of(node)`...). Offsets are byte offsets into the UTF-8 text, as in zgram and zrules.
+Python functions that add to what the server does. Each gets the file's URI, its text, and the zrules `Analysis` of the file (None without rules) to look things up in (`analysis.at(offset)`, `analysis.visible(offset)`, `analysis.type_of(node)`...). Offsets are byte offsets into the UTF-8 text, as in zgram and zrules.
 
 ```python
 def hover(uri, text, offset, analysis):
