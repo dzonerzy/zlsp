@@ -10,9 +10,11 @@ program    = ws (stmt ws)*
 @silent stmt = import_stmt | from_stmt | struct_def | funcdef | if_stmt | while_stmt | loop_stmt | do_stmt | return_stmt | break_stmt | continue_stmt | let_stmt | assign | expr_stmt
 import_stmt = 'import' kw ws module:ident ws ';'
 from_stmt   = 'from' kw ws module:ident ws 'import' kw ws names:ident (ws ',' ws names:ident)* ws ';'
-struct_def = 'struct' kw ws name:ident ws '{' ws (field ws)* (funcdef ws)* '}'
+struct_def = 'struct' kw ws name:ident tparam_list? (ws ':' ws bases:type_expr (ws ',' ws bases:type_expr)*)? ws '{' ws (field ws)* (funcdef ws)* '}'
 field      = name:ident ws ':' ws type:type_expr ws ';'
-funcdef    = 'fn' kw ws name:ident ws '(' ws (params:param (ws ',' ws params:param)*)? ws ')' (ws '->' ws returns:type_expr)? ws block
+funcdef    = 'fn' kw ws name:ident tparam_list? ws '(' ws (params:param (ws ',' ws params:param)*)? ws ')' (ws '->' ws returns:type_expr)? ws block
+@silent tparam_list = ws '[' ws tparams:tparam (ws ',' ws tparams:tparam)* ws ']'
+tparam     = name:ident
 param      = name:ident (ws ':' ws type:type_expr)?
 block      = '{' ws (stmt ws)* '}'
 if_stmt    = 'if' kw ws cond:expr ws block (ws 'else' kw ws (if_stmt | block))?
@@ -26,11 +28,12 @@ let_stmt   = 'let' kw ws name:ident (ws ':' ws type:type_expr)? (ws '=' ws value
 assign     = target:postfix ws '=' !'=' ws value:expr ws ';'
 @silent expr_stmt = expr ws ';'
 
-@postfix type_expr = target:simple_type optional_type*
+@postfix type_expr = members:single_type union_type*
+union_type = ws '|' ws members:single_type
+@postfix single_type = target:simple_type optional_type*
 optional_type = '?'
-@silent simple_type = generic_type | type_name
-generic_type = base:type_ident '[' ws args:type_expr (ws ',' ws args:type_expr)* ws ']'
-type_ident = [a-zA-Z_]+
+@silent simple_type = generic_type | type_name | '(' ws type_expr ws ')'
+generic_type = base:type_name '[' ws args:type_expr (ws ',' ws args:type_expr)* ws ']'
 type_name  = [a-zA-Z_] [a-zA-Z0-9_]*
 
 @left expr  = left:sum (ws op:cmpop ws right:sum)?
@@ -66,14 +69,15 @@ COMPARE = [("int", "int", "bool"), ("float", "float", "bool"), ("str", "str", "b
 
 SCOPES = dict(
     scope=("program", "funcdef", "struct_def"),
-    define=("let_stmt > .name", "param > .name", "field > .name"),
+    define=("let_stmt > .name", "param > .name", "field > .name", "tparam > .name"),
     define_outer=("funcdef > .name", "struct_def > .name"),
     use="ident, type_name",
     hoist=("funcdef > .name", "struct_def > .name"),
     after="let_stmt > .name",
     members="member",
     imports="import_stmt, from_stmt",
-    builtins=("print", "len"),
+    # (`list`, `map`, `set`: the built-in generic types' names, `list[int]`)
+    builtins=("print", "len", "list", "map", "set"),
 )
 
 TYPES = dict(
@@ -84,6 +88,7 @@ TYPES = dict(
     type_names="type_name",
     type_args="generic_type",
     optional="optional_type",
+    unions="union_type",
     variables="let_stmt, param, field",
     functions="funcdef",
     structs="struct_def",

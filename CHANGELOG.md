@@ -5,6 +5,11 @@ All notable changes to zlsp are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-08
+
+### Changed
+- Requires zgram 0.5.0 and zrules 0.2.0. A language's generic functions and types, unions and subtypes (zrules' `types()`) show in hovers, completions and diagnostics as zrules writes them (`fn(list[T]) -> T`, `int | str`), and its type parameters are names like any other (definition, references, rename); recovery from syntax errors keeps more of a broken file's structure (zgram's), and grammars compile once per machine (zgram's disk cache): the server starts faster.
+
 ## [0.1.2] - 2026-10-07
 
 ### Changed
