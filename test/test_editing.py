@@ -268,7 +268,7 @@ class TestHooks:
         with pytest.raises(TypeError, match="hover must be callable"):
             typed_server(hover=1)
 
-    def test_a_hook_must_be_callable(self):
+    def test_the_configuration_hook_must_be_callable(self):
         with pytest.raises(TypeError, match="configuration must be callable"):
             typed_server(configuration="x")
 
